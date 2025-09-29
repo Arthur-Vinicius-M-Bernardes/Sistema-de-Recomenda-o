@@ -19,7 +19,7 @@ Nossa base de dados é esparsa, cheia de zeros (ausência de avaliação). A mé
     
 É feita uma seleção aleatória de respostas corretas para cada usuário e é comparada com as recomendações feitas pelo algoritmo de recomendação, então é aplicado a fórmula:
 
-$acurácia = \frac{número de acertos}{número de itens recomendados}$
+$\acurácia = frac{número de acertos}{número de itens recomendados}$
 
 
 # Sistema-de-Recomenda-o
