@@ -5,8 +5,8 @@ Recomendar N números de filmes, para o usuário escolhido
 * Como executar o frontend e backend
 
 Executar os seguintes comandos no terminal
-- uvicorn backend:app --reload
-- streamlit run frontend.py
+uvicorn backend:app --reload
+streamlit run frontend.py
 
 * Explicação da lógica de recomendação
 
@@ -20,6 +20,7 @@ Nossa base de dados é esparsa, cheia de zeros (ausência de avaliação). A mé
 
 
 # Sistema-de-Recomenda-o
+
 
 
 
