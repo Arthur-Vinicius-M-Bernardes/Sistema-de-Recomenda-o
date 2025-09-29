@@ -6,221 +6,195 @@ import streamlit as st
 
 st.set_page_config(page_title="Sistema de Recomendação - MovieLens 100K", layout="wide")
 
-# Configuração da API do TMDB (retirada da variável de ambiente)
+# Configuração da API do TMDB
 TMDB_API_KEY = "5a0a89104a4fc273fb664827c8682454"
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 TMDB_GENRE_URL = "https://api.themoviedb.org/3/genre/movie/list"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 PLACEHOLDER = "https://via.placeholder.com/300x450?text=Sem+Imagem"
 
-# Mensagem se a chave não estiver definida
 if not TMDB_API_KEY:
-    st.warning("A variável de ambiente TMDB_API_KEY não está definida. Os pósteres podem não ser exibidos.")
+    st.warning("A variável de ambiente TMDB_API_KEY não está definida.")
 
-st.title("🎬 Sistema de Recomendação de Filmes")
-st.write("MovieLens 100K — Recomendação por similaridade (cosseno)")
+st.title("Sistema de Recomendação de Filmes")
 
-# Entradas do utilizador
-usuario_id = st.number_input("Digite o ID do usuário (1 a 943)", min_value=1, max_value=943, value=1, step=1)
-n_recomendacoes = st.slider("Número de recomendações", min_value=1, max_value=20, value=10)
+# --- Carregar dados dos filmes para o seletor ---
+@st.cache_data
+def carregar_filmes():
+    try:
+        df_filmes = pd.read_csv(os.path.join("converted_data", "movies.csv"))
+        if 'title' in df_filmes.columns:
+            df_filmes.rename(columns={'title': 'titulo'}, inplace=True)
+        mapa_titulo_id = pd.Series(df_filmes.movie_id.values, index=df_filmes.titulo).to_dict()
+        return df_filmes, mapa_titulo_id
+    except FileNotFoundError:
+        st.error("ERRO: 'converted_data/movies.csv' não encontrado. Execute o script de conversão primeiro.")
+        return pd.DataFrame(columns=['titulo']), {}
 
+df_filmes, mapa_titulo_id = carregar_filmes()
+
+# --- Funções de busca de dados ---
 @st.cache_data(show_spinner=False)
 def get_genre_map():
-    """Busca o mapa de IDs de género para nomes da API do TMDB."""
-    if not TMDB_API_KEY:
-        return {}
+    if not TMDB_API_KEY: return {}
     params = {"api_key": TMDB_API_KEY, "language": "pt-BR"}
     try:
         resp = requests.get(TMDB_GENRE_URL, params=params, timeout=5)
         if resp.status_code == 200:
             genres = resp.json().get("genres", [])
             return {genre["id"]: genre["name"] for genre in genres}
-    except Exception as e:
-        print(f"Erro ao buscar mapa de géneros: {e}")
-    return {}
+    except: return {}
 
 @st.cache_data(show_spinner=False)
 def buscar_info_tmdb(titulo: str, ano=None):
-    """Busca póster, data e outras informações no TMDB."""
-    if not TMDB_API_KEY:
-        return {"poster": PLACEHOLDER, "release_date": "", "overview": "", "genres": ""}
-
+    if not TMDB_API_KEY: return {"poster": PLACEHOLDER, "release_date": "", "overview": "", "genres": ""}
     genre_map = get_genre_map()
-    titulo_limpo = titulo.strip()
-    titulo_limpo = titulo_limpo.split(' (')[0]
-    articles_to_move = [", the", ", a", ", an"]
-    for article in articles_to_move:
-        if titulo_limpo.lower().endswith(article):
-            titulo_sem_artigo = titulo_limpo[:-len(article)]
-            artigo_prefixo = article[2:].strip().capitalize()
-            titulo_limpo = f"{artigo_prefixo} {titulo_sem_artigo}"
+    titulo_limpo = titulo.strip().split(' (')[0]
+    articles = [", the", ", a", ", an"]
+    for art in articles:
+        if titulo_limpo.lower().endswith(art):
+            titulo_limpo = f"{art[2:].strip().capitalize()} {titulo_limpo[:-len(art)]}"
             break
-
-    params = {
-        "api_key": TMDB_API_KEY,
-        "query": titulo_limpo,
-        "language": "pt-BR",
-        "include_adult": "false",
-        "page": 1
-    }
-    if ano:
-        params["primary_release_year"] = int(ano) if (isinstance(ano, (int, float)) and not pd.isna(ano)) else None
-    params = {k: v for k, v in params.items() if v is not None}
-
+    params = {"api_key": TMDB_API_KEY, "query": titulo_limpo, "language": "pt-BR", "page": 1}
+    if ano: params["primary_release_year"] = int(ano) if pd.notna(ano) else None
+    
     try:
-        resp = requests.get(TMDB_SEARCH_URL, params=params, timeout=6)
+        resp = requests.get(TMDB_SEARCH_URL, params={k: v for k, v in params.items() if v is not None})
         if resp.status_code == 200:
-            results = resp.json().get("results", []) or []
+            results = resp.json().get("results", [])
             if not results and "primary_release_year" in params:
                 params.pop("primary_release_year", None)
-                resp2 = requests.get(TMDB_SEARCH_URL, params=params, timeout=6)
-                if resp2.status_code == 200:
-                    results = resp2.json().get("results", []) or []
-
-            if results:
-                results_with_posters = [res for res in results if res.get("poster_path")]
-                if results_with_posters:
-                    results_with_posters.sort(key=lambda x: x.get("popularity", 0), reverse=True)
-                    best = results_with_posters[0]
-                    poster_path = best.get("poster_path")
-                    release = best.get("release_date", "")
-                    overview = best.get("overview", "")
-                    poster_url = f"{TMDB_IMAGE_BASE}{poster_path}"
-                    genre_ids = best.get("genre_ids", [])
-                    genres_list = [genre_map.get(gid) for gid in genre_ids if genre_map.get(gid)]
-                    genres_str = ", ".join(genres_list[:3])
-                    return {"poster": poster_url, "release_date": release, "overview": overview, "genres": genres_str}
-    except Exception as e:
-        print("Erro ao buscar no TMDB:", e)
+                resp = requests.get(TMDB_SEARCH_URL, params=params)
+                if resp.status_code == 200: results = resp.json().get("results", [])
+            
+            results_with_posters = [r for r in results if r.get("poster_path")]
+            if results_with_posters:
+                best = sorted(results_with_posters, key=lambda x: x.get("popularity", 0), reverse=True)[0]
+                genres_list = [genre_map.get(gid) for gid in best.get("genre_ids", []) if genre_map.get(gid)]
+                return {
+                    "poster": f"{TMDB_IMAGE_BASE}{best.get('poster_path')}",
+                    "release_date": best.get("release_date", ""),
+                    "overview": best.get("overview", ""),
+                    "genres": ", ".join(genres_list[:3])
+                }
+    except Exception as e: print(f"Erro TMDB: {e}")
     return {"poster": PLACEHOLDER, "release_date": "", "overview": "", "genres": ""}
 
-# --- Estrutura com colunas para os botões ---
-col1, col2 = st.columns(2)
+# --- Função do Modal (usando decorador para robustez) ---
+@st.dialog("Detalhes do Filme")
+def mostrar_detalhes_filme(info):
+    """Cria e exibe o modal de detalhes do filme."""
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.image(info.get('poster', PLACEHOLDER))
+    with col2:
+        st.subheader(info['titulo'])
+        st.caption(f"Lançamento: {info.get('release_date', 'N/A')} | Score: {info.get('score', 0)}%")
+        st.markdown(f"**Gêneros:** {info.get('genres', 'N/A')}")
+        st.markdown("---")
+        st.markdown(f"**Sinopse:**")
+        st.markdown(f"<p style='text-align: justify;'>{info.get('overview', 'Não disponível.')}</p>", unsafe_allow_html=True)
 
+    if st.button("Fechar", key="fechar_modal"):
+        del st.session_state.filme_para_exibir
+        st.rerun()
+
+# --- Layout Principal ---
+usuario_id = st.number_input("Digite o ID do usuário (1 a 943)", min_value=1, max_value=943, value=1, step=1)
+n_recomendacoes = st.slider("Número de recomendações", min_value=1, max_value=20, value=10)
+
+if not df_filmes.empty:
+    with st.expander("📝 Avaliar um Filme"):
+        filme_selecionado = st.selectbox(
+            "Escolha um filme para avaliar",
+            options=sorted(df_filmes['titulo'].dropna().unique()),
+            index=0
+        )
+        nota_filme = st.slider("Sua nota (1 a 5 estrelas)", 1, 5, 3)
+        
+        if st.button("Enviar Avaliação"):
+            id_filme_avaliado = mapa_titulo_id.get(filme_selecionado)
+            if id_filme_avaliado:
+                with st.spinner("A enviar a sua avaliação..."):
+                    try:
+                        payload = {"usuario_id": int(usuario_id), "movie_id": int(id_filme_avaliado), "rating": int(nota_filme)}
+                        resp = requests.post("http://127.0.0.1:8000/avaliar-filme", json=payload, timeout=15)
+                        if resp.status_code == 200:
+                            st.success(f"Avaliação para '{filme_selecionado}' enviada!")
+                        else:
+                            st.error(f"O backend retornou um erro: {resp.status_code} - {resp.text}")
+                    except Exception as e:
+                        st.error(f"Erro ao conectar ao backend: {e}")
+
+col1, col2 = st.columns(2)
 with col1:
     if st.button("Gerar Recomendações"):
-        with st.spinner("A consultar o backend e a preparar os cards..."):
+        with st.spinner("A consultar o backend..."):
             try:
-                resp = requests.post("http://127.0.0.1:8000/recomendar",
-                                     json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)},
-                                     timeout=12)
-            except Exception as e:
-                st.error(f"Erro ao conectar ao backend: {e}")
-                st.stop()
-
-            if resp.status_code != 200:
-                st.error(f"O backend retornou um erro: {resp.status_code} - {resp.text}")
-                st.stop()
-
-            recomendacoes = resp.json()
-            if isinstance(recomendacoes, dict) and "erro" in recomendacoes:
-                st.error(recomendacoes["erro"])
-                st.stop()
-
-            df = pd.DataFrame(recomendacoes)
-            if df.empty:
-                st.info("Nenhuma recomendação encontrada.")
-                st.stop()
-
-            if "titulo" not in df.columns:
-                st.error("A resposta do backend não contém a chave 'titulo'. Verifique o backend.")
-                st.stop()
-            if "score" not in df.columns:
-                df["score"] = 0.0
-            if "ano" not in df.columns:
-                df["ano"] = None
-
-            cards = []
-            for _, row in df.iterrows():
-                titulo_raw = str(row.get("titulo", "Título desconhecido"))
-                info = buscar_info_tmdb(titulo_raw, row.get("ano"))
-                
-                try:
-                    pct = int(round(float(row.get("score", 0.0)) / 5.0 * 100))
-                    pct = max(0, min(100, pct))
-                except:
-                    pct = 0
-                
-                cards.append({
-                    "titulo": html.escape(titulo_raw),
-                    "score": pct,
-                    "release_date": html.escape(info.get("release_date", "")),
-                    "genres": html.escape(info.get("genres", "")),
-                    "overview": html.escape(info.get("overview", "")),
-                    "poster_url": info.get("poster", PLACEHOLDER)
-                })
-            
-            # Placeholder para os cards serem renderizados depois
-            st.session_state.cards_to_show = cards
+                resp = requests.post("http://127.0.0.1:8000/recomendar", json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)})
+                if resp.status_code == 200:
+                    st.session_state.recomendacoes = resp.json()
+                    if 'filme_para_exibir' in st.session_state:
+                         del st.session_state['filme_para_exibir']
+                else: st.error(f"Erro no backend: {resp.text}")
+            except Exception as e: st.error(f"Erro de conexão: {e}")
 
 with col2:
     if st.button("Avaliar Acurácia"):
-        with st.spinner("A calcular a acurácia..."):
+        with st.spinner("A calcular acurácia..."):
             try:
-                resp = requests.post("http://127.0.0.1:8000/avaliar",
-                                     json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)},
-                                     timeout=15) # Timeout um pouco maior para o cálculo
+                resp = requests.post("http://127.0.0.1:8000/avaliar", json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)})
                 if resp.status_code == 200:
-                    resultado = resp.json()
-                    if "erro" in resultado:
-                        st.error(resultado["erro"])
+                    res = resp.json()
+                    if "erro" in res: st.error(res["erro"])
                     else:
-                        acuracia_pct = int(resultado["acuracia"] * 100)
-                        acertos = resultado["acertos"]
-                        total = resultado["total_recomendado"]
-                        
-                        st.success(f"Acurácia calculada para o usuário {usuario_id}!")
-                        st.metric(
-                            label="Acurácia do Modelo",
-                            value=f"{acuracia_pct}%",
-                            delta=f"{acertos} acertos de {total} recomendações",
-                            delta_color="normal"
-                        )
-                else:
-                    st.error(f"O backend retornou um erro: {resp.status_code} - {resp.text}")
+                        st.success(f"Acurácia para usuário {usuario_id}:")
+                        st.metric(label="Acurácia", value=f"{int(res['acuracia']*100)}%", delta=f"{res['acertos']} acertos de {res['total_recomendado']}")
+                else: st.error(f"Erro no backend: {resp.text}")
+            except Exception as e: st.error(f"Erro de conexão: {e}")
 
-            except Exception as e:
-                st.error(f"Erro ao conectar ao backend para avaliação: {e}")
+# --- Chamada da função do Modal ---
+if 'filme_para_exibir' in st.session_state:
+    mostrar_detalhes_filme(st.session_state.filme_para_exibir)
 
-# --- Lógica de renderização dos cards (fora dos botões) ---
-st.markdown(
-    """
-    <style>
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 18px; align-items: start; margin-top: 12px; }
-    .card { background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.12); transition: transform .15s ease; position: relative; }
-    .card:hover { transform: translateY(-6px); }
-    .poster { width: 100%; height: 270px; object-fit: cover; display:block; }
-    .info { padding: 10px; font-family: "Arial", sans-serif; color: #111; }
-    .title { font-weight: 700; margin: 6px 0 4px 0; font-size: 14px; min-height: 38px; }
-    .date { color: #666; font-size: 12px; margin-bottom: 6px; }
-    .score-badge { position: absolute; top: 10px; left: 10px; width: 44px; height: 44px; border-radius: 22px; background: linear-gradient(180deg,#21d07a,#2bbf6f); color: white; display:flex; align-items:center; justify-content:center; font-weight:700; box-shadow: 0 2px 6px rgba(0,0,0,0.25); }
-    .genres { font-size: 11px; color: #888; font-style: italic; margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .overview { font-size: 12px; color: #444; margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# --- CSS para os cards ---
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+body { font-family: 'Inter', sans-serif; }
+.card-container {
+    background-color: #1a1a24; border-radius: 12px; padding: 1rem; border: 1px solid #2a2a38;
+    transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out; margin-bottom: 1rem;
+}
+.card-container:hover { transform: translateY(-5px); box-shadow: 0 8px 16px rgba(0,0,0,0.4); }
+.movie-title {
+    font-weight: 600; font-size: 1rem; color: #f0f0f5; margin-top: 0.5rem; height: 48px;
+    overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+</style>
+""", unsafe_allow_html=True)
 
-if 'cards_to_show' in st.session_state and st.session_state.cards_to_show:
-    cards_html_list = ['<div class="grid">']
-    for card in st.session_state.cards_to_show:
-        card_html = (
-            f'<div class="card">'
-                f'<div style="position:relative;">'
-                    f'<img class="poster" src="{card["poster_url"]}" alt="{card["titulo"]}">'
-                    f'<div class="score-badge">{card["score"]}%</div>'
-                f'</div>'
-                f'<div class="info">'
-                    f'<div class="title">{card["titulo"]}</div>'
-                    f'<div class="date">{card["release_date"]}</div>'
-                    f'<div class="genres">{card["genres"]}</div>'
-                    f'<div class="overview">{card["overview"]}</div>'
-                f'</div>'
-            f'</div>'
-        )
-        cards_html_list.append(card_html)
-    cards_html_list.append("</div>")
-    st.markdown("".join(cards_html_list), unsafe_allow_html=True)
-    # Limpa o estado para não mostrar os mesmos cards após uma atualização ou outra ação
-    st.session_state.cards_to_show = None
+# --- Renderização da Grelha de Recomendações ---
+if 'recomendacoes' in st.session_state:
+    recomendacoes = st.session_state.recomendacoes
+    if isinstance(recomendacoes, dict) and "erro" in recomendacoes:
+        st.error(recomendacoes["erro"])
+    elif recomendacoes:
+        num_cols = 5
+        cols = st.columns(num_cols)
+        for i, rec in enumerate(recomendacoes):
+            with cols[i % num_cols]:
+                with st.container():
+                    st.markdown(f'<div class="card-container">', unsafe_allow_html=True)
+                    info_api = buscar_info_tmdb(rec['titulo'], rec.get('ano'))
+                    score_pct = int(round(rec.get("score", 0.0) / 5.0 * 100))
+                    st.image(info_api['poster'])
+                    st.markdown(f'<p class="movie-title">{html.escape(rec["titulo"])}</p>', unsafe_allow_html=True)
+                    if st.button("Ver Detalhes", key=f"details_{rec['movie_id']}"):
+                        st.session_state.filme_para_exibir = {
+                            'titulo': rec['titulo'], 'poster': info_api['poster'], 'release_date': info_api['release_date'],
+                            'genres': info_api['genres'], 'overview': info_api['overview'], 'score': score_pct
+                        }
+                        st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
 
