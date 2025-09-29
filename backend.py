@@ -8,7 +8,6 @@ import os
 
 app = FastAPI(title="Recomendador MovieLens 100K - Cosine")
 
-# ===== Modelos de entrada =====
 class RequisicaoRecomendacao(BaseModel):
     usuario_id: int
     n_recomendacoes: int = 5
@@ -18,7 +17,6 @@ class RequisicaoAvaliacao(BaseModel):
     movie_id: int
     rating: int
 
-# --- CAMINHOS ATUALIZADOS ---
 # Aponta para a pasta criada pelo seu novo script de conversão
 RATINGS_FILE = os.path.join("converted_data", "ratings.csv")
 MOVIES_FILE = os.path.join("converted_data", "movies.csv")
