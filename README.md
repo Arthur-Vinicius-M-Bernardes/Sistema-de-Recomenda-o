@@ -17,9 +17,7 @@ Foi utilizado a métrica de similaridade do Cosseno, onde os usuários são trat
 Nossa base de dados é esparsa, cheia de zeros (ausência de avaliação). A métrica de similaridade do Cosseno lida melhor com esse tipo de estrutura, não tendo uma perda de qualidade significativa.
 * Cálculo e análise da acurácia
     
-É feita uma seleção aleatória de respostas corretas para cada usuário e é comparada com as recomendações feitas pelo algoritmo de recomendação, então é aplicado a fórmula:
-
-$$ acurácia = {número de acertos \over número de itens recomendados} $$
+É feita uma seleção aleatória de respostas corretas para cada usuário e é comparada com as recomendações feitas pelo algoritmo de recomendação, então é aplicado a fórmula: número de acertos/ número de itens recomendados
 
 # Sistema-de-Recomenda-o
 
