@@ -16,8 +16,7 @@ PLACEHOLDER = "https://via.placeholder.com/300x450?text=Sem+Imagem"
 if not TMDB_API_KEY:
     st.warning("A variável de ambiente TMDB_API_KEY não está definida.")
 
-st.title("🎬 Sistema de Recomendação de Filmes")
-st.write("MovieLens 100K — Recomendação por similaridade (cosseno)")
+st.title("Sistema de Recomendação de Filmes")
 
 # --- Carregar dados dos filmes para o seletor ---
 @st.cache_data
