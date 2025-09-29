@@ -16,7 +16,8 @@ PLACEHOLDER = "https://via.placeholder.com/300x450?text=Sem+Imagem"
 if not TMDB_API_KEY:
     st.warning("A variável de ambiente TMDB_API_KEY não está definida.")
 
-st.title("Sistema de Recomendação de Filmes")
+st.title("🎬 Sistema de Recomendação de Filmes")
+st.write("MovieLens 100K — Recomendação por similaridade (cosseno)")
 
 # --- Carregar dados dos filmes para o seletor ---
 @st.cache_data
@@ -95,8 +96,7 @@ def mostrar_detalhes_filme(info):
         st.markdown(f"**Sinopse:**")
         st.markdown(f"<p style='text-align: justify;'>{info.get('overview', 'Não disponível.')}</p>", unsafe_allow_html=True)
 
-    if st.button("Fechar", key="fechar_modal"):
-        del st.session_state.filme_para_exibir
+    if st.button("Fechar"):
         st.rerun()
 
 # --- Layout Principal ---
@@ -134,8 +134,6 @@ with col1:
                 resp = requests.post("http://127.0.0.1:8000/recomendar", json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)})
                 if resp.status_code == 200:
                     st.session_state.recomendacoes = resp.json()
-                    if 'filme_para_exibir' in st.session_state:
-                         del st.session_state['filme_para_exibir']
                 else: st.error(f"Erro no backend: {resp.text}")
             except Exception as e: st.error(f"Erro de conexão: {e}")
 
@@ -152,10 +150,6 @@ with col2:
                         st.metric(label="Acurácia", value=f"{int(res['acuracia']*100)}%", delta=f"{res['acertos']} acertos de {res['total_recomendado']}")
                 else: st.error(f"Erro no backend: {resp.text}")
             except Exception as e: st.error(f"Erro de conexão: {e}")
-
-# --- Chamada da função do Modal ---
-if 'filme_para_exibir' in st.session_state:
-    mostrar_detalhes_filme(st.session_state.filme_para_exibir)
 
 # --- CSS para os cards ---
 st.markdown("""
@@ -190,11 +184,14 @@ if 'recomendacoes' in st.session_state:
                     score_pct = int(round(rec.get("score", 0.0) / 5.0 * 100))
                     st.image(info_api['poster'])
                     st.markdown(f'<p class="movie-title">{html.escape(rec["titulo"])}</p>', unsafe_allow_html=True)
+                    
                     if st.button("Ver Detalhes", key=f"details_{rec['movie_id']}"):
-                        st.session_state.filme_para_exibir = {
+                        # Prepara as informações e chama a função do modal diretamente
+                        info_para_modal = {
                             'titulo': rec['titulo'], 'poster': info_api['poster'], 'release_date': info_api['release_date'],
                             'genres': info_api['genres'], 'overview': info_api['overview'], 'score': score_pct
                         }
-                        st.rerun()
+                        mostrar_detalhes_filme(info_para_modal)
+
                     st.markdown('</div>', unsafe_allow_html=True)
 
