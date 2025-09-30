@@ -16,7 +16,7 @@ PLACEHOLDER = "https://via.placeholder.com/300x450?text=Sem+Imagem"
 if not TMDB_API_KEY:
     st.warning("A variável de ambiente TMDB_API_KEY não está definida.")
 
-st.title("Sistema de Recomendação de Filmes")
+st.title("Sistema de Recomendação de Filmes Antigos")
 
 # --- Carregar dados dos filmes para o seletor ---
 @st.cache_data
@@ -90,9 +90,9 @@ def mostrar_detalhes_filme(info):
     with col2:
         st.subheader(info['titulo'])
         st.caption(f"Lançamento: {info.get('release_date', 'N/A')} | Score: {info.get('score', 0)}%")
-        st.markdown(f"**Gêneros:** {info.get('genres', 'N/A')}")
+        st.markdown(f"*Gêneros:* {info.get('genres', 'N/A')}")
         st.markdown("---")
-        st.markdown(f"**Sinopse:**")
+        st.markdown(f"*Sinopse:*")
         st.markdown(f"<p style='text-align: justify;'>{info.get('overview', 'Não disponível.')}</p>", unsafe_allow_html=True)
 
     if st.button("Fechar"):
@@ -140,7 +140,7 @@ with col2:
     if st.button("Avaliar Acurácia"):
         with st.spinner("A calcular acurácia..."):
             try:
-                resp = requests.post("http://127.0.0.1:8000/avaliar", json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)})
+                resp = requests.post("http://127.0.0.1:8000/calcular-acuracia-usuario", json={"usuario_id": int(usuario_id), "n_recomendacoes": int(n_recomendacoes)})
                 if resp.status_code == 200:
                     res = resp.json()
                     if "erro" in res: st.error(res["erro"])
@@ -193,4 +193,3 @@ if 'recomendacoes' in st.session_state:
                         mostrar_detalhes_filme(info_para_modal)
 
                     st.markdown('</div>', unsafe_allow_html=True)
-
