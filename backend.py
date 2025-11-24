@@ -1,211 +1,619 @@
-from fastapi import FastAPI
+# backend.py
+# FastAPI backend: filtragem baseada em conteúdo usando TF-IDF
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import time
-import os
-
-app = FastAPI(title="Recomendador MovieLens 100K - Cosine")
-
-class RequisicaoRecomendacao(BaseModel):
-    usuario_id: int
-    n_recomendacoes: int = 5
-
-class RequisicaoAvaliacao(BaseModel):
-    usuario_id: int
-    movie_id: int
-    rating: int
-
-# Aponta para a pasta criada pelo seu novo script de conversão
-RATINGS_FILE = os.path.join("converted_data", "ratings.csv")
-MOVIES_FILE = os.path.join("converted_data", "movies.csv")
-
-# Ler ratings e filmes
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import normalize as sk_normalize
+from sklearn.decomposition import TruncatedSVD
+from typing import List, Optional
+import uvicorn
+# optional Surprise (better collaborative filtering)
 try:
-    ratings = pd.read_csv(RATINGS_FILE)
-    movies = pd.read_csv(MOVIES_FILE)
-except FileNotFoundError:
-    raise RuntimeError("ERRO: Ficheiros CSV não encontrados na pasta 'converted_data'. Execute o seu script de conversão primeiro.")
+    from surprise import Dataset, Reader, SVD as SurpriseSVD
+    _HAS_SURPRISE = True
+except Exception:
+    _HAS_SURPRISE = False
 
-# Renomear coluna 'title' para 'titulo' para manter a consistência com o resto do código
-if 'title' in movies.columns:
-    movies.rename(columns={'title': 'titulo'}, inplace=True)
+app = FastAPI(title="Recomendador - Filtragem por Conteúdo")
 
-# Extrair ano
-def extrair_ano(d):
+# Paths dos CSVs (ajuste se necessário)
+ITEMS_CSV = "filmes.csv"
+EVAL_CSV = "aval.csv"  # arquivo de avaliações (usuario_id,item_id,nota)
+
+# Configs
+POSITIVE_RATING_THRESHOLD = 4  # nota >= 4 -> "gostou"
+TEST_SIZE_PER_USER = 0.2  # fração para teste nas métricas
+
+
+# --- carga de dados e preparação ---
+items_df = pd.DataFrame()
+eval_df = pd.DataFrame()
+item_ids = []
+item_id_to_idx = {}
+idx_to_item_id = {}
+tfidf = None
+item_vectors = None
+item_popularity = None
+# collaborative globals
+user_ids = []
+user_id_to_idx = {}
+user_factors = None
+item_factors_collab = None
+collab_k = 50
+
+# blending weight between content and collaborative (0..1). Higher => more CF
+# running in content-only mode by default: disable collaborative blending
+collab_beta = 0.0
+collab_method = 'svd'  # kept for reference; CF training will not run when collab_beta == 0.0
+
+# SBERT / semantic embeddings (content-only alternative)
+USE_SBERT = False
+SBERT_MODEL = 'all-MiniLM-L6-v2'  # small, fast, good quality
+# Se True, concatena TF-IDF (dense) com SBERT (dense) e normaliza o vetor final
+CONCAT_SBERT = False
+# Concatena TF-IDF word + TF-IDF char_wb para tentar capturar sinais distintos
+CONCAT_WORD_CHAR_TFIDF = False
+WORD_MAX_FEATURES = 4000
+CHAR_MAX_FEATURES = 4000
+# Parametros TF-IDF ajustáveis (padrões ótimizados encontrados)
+TITLE_REPEAT = 1
+TFIDF_MAX_FEATURES = 8000
+TFIDF_MIN_DF = 1
+
+def load_data():
+    global items_df, eval_df, item_ids, item_id_to_idx, idx_to_item_id
+    # Carrega itens (usa latin-1 para suportar acentuação do dataset)
+    # muitos arquivos do MovieLens (u.item) usam '|' como separador e não têm header
+    # definir nomes de colunas compatíveis com u.item
+    cols = ["item_id", "title", "release_date", "video_release_date", "imdb_url"]
+    genre_cols = ["unknown", "Action", "Adventure", "Animation", "Children", "Comedy", "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir", "Horror", "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western"]
+    all_cols = cols + genre_cols
+    items_df = pd.read_csv(ITEMS_CSV, dtype=str, encoding='latin-1', sep='|', engine='python', header=None, names=all_cols).fillna("")
+    # Se as colunas de gênero existem (flags 0/1), transformar em uma coluna 'categoria' legível
     try:
-        if isinstance(d, str):
-            # Tenta extrair o ano a partir da data completa (formato YYYY-MM-DD)
-            return pd.to_datetime(d).year
-    except: pass
-    return None
+        genre_names = genre_cols
+        # os valores nas colunas podem ser '0'/'1' ou 0/1
+        def _genres_from_row(r):
+            parts = []
+            for g in genre_names:
+                if g in items_df.columns:
+                    val = str(r.get(g, "")).strip()
+                    if val in ("1", "True", "true", "T"):
+                        parts.append(g)
+            return ", ".join(parts)
+        items_df["categoria"] = items_df.apply(_genres_from_row, axis=1)
+    except Exception:
+        pass
+    # tenta detectar as colunas common (item_id,nome,descricao,tags,categoria)
+    # normalizar nomes:
+    # Aceita colunas como: item_id, id, nome, title, descricao, description, tags, genero, categoria
+    colmap = {}
+    cols = [c.lower() for c in items_df.columns]
+    for c in items_df.columns:
+        lc = c.lower()
+        if lc in ("item_id", "id"):
+            colmap[c] = "item_id"
+        elif lc in ("nome", "title", "name"):
+            colmap[c] = "nome"
+        elif "desc" in lc:
+            colmap[c] = "descricao"
+        elif "tag" in lc:
+            colmap[c] = "tags"
+        elif lc in ("categoria", "genero", "genre"):
+            colmap[c] = "categoria"
+    items_df = items_df.rename(columns=colmap)
+    if "item_id" not in items_df.columns:
+        # tenta criar item_id a partir do index
+        items_df["item_id"] = items_df.index.astype(str)
+    # Coloca colunas ausentes
+    for required in ("nome", "descricao", "tags", "categoria"):
+        if required not in items_df.columns:
+            items_df[required] = ""
 
-movies["ano"] = movies["release_date"].apply(extrair_ano)
+    # criar representação tokenizada de gêneros: 'Action, Drama' -> 'genre_Action genre_Drama'
+    def _genre_tokens(s):
+        try:
+            if not isinstance(s, str):
+                return ""
+            parts = [p.strip() for p in s.split(',') if p.strip()]
+            tokens = [f"genre_{p.replace(' ', '_')}" for p in parts]
+            return " ".join(tokens)
+        except Exception:
+            return ""
 
-# --- Variáveis Globais para o Modelo (para que possam ser atualizadas) ---
-user_item = None
-user_matrix = None
-user_sim_matrix = None
-user_id_to_index = None
-index_to_user_id = None
+    items_df["genre_tokens"] = items_df["categoria"].astype(str).apply(_genre_tokens)
 
-def construir_modelo():
-    """Função para construir ou reconstruir o modelo de recomendação em memória."""
-    global user_item, user_matrix, user_sim_matrix, user_id_to_index, index_to_user_id, ratings
+    # Normalizar títulos: 'Matrix, The' -> 'The Matrix'
+    def _normalize_title(t):
+        try:
+            if not isinstance(t, str):
+                return t
+            t = t.strip()
+            # pattern: 'Something, The' or 'Something, A' or 'Something, An'
+            import re
+            m = re.match(r"^(.*),\s*(The|A|An)$", t, flags=re.IGNORECASE)
+            if m:
+                article = m.group(2).strip()
+                body = m.group(1).strip()
+                return f"{article} {body}"
+            return t
+        except Exception:
+            return t
 
-    print("A construir/atualizar o modelo de recomendação...")
-    # Garante que os IDs sejam inteiros para o pivot
-    ratings['user_id'] = ratings['user_id'].astype(int)
-    ratings['movie_id'] = ratings['movie_id'].astype(int)
-    
-    user_item = ratings.pivot_table(index="user_id", columns="movie_id", values="rating").fillna(0)
-    user_matrix = user_item.values
-    user_sim_matrix = cosine_similarity(user_matrix)
-    
-    user_ids = user_item.index.to_numpy()
-    user_id_to_index = {uid: idx for idx, uid in enumerate(user_ids)}
-    index_to_user_id = {idx: uid for uid, idx in user_id_to_index.items()}
-    print("Modelo pronto.")
+    items_df["nome"] = items_df["nome"].astype(str).apply(_normalize_title)
 
-# Construir o modelo inicial ao arrancar
-construir_modelo()
+    # extrair ano de release se possível e criar token year_YYYY
+    def _extract_year(rd):
+        try:
+            if not isinstance(rd, str):
+                return ""
+            rd = rd.strip()
+            if len(rd) >= 4:
+                import re
+                m = re.search(r"(19|20)\d{2}", rd)
+                if m:
+                    return f"year_{m.group(0)}"
+            return ""
+        except Exception:
+            return ""
+
+    items_df["year_token"] = items_df["release_date"].astype(str).apply(_extract_year)
+
+    item_ids = list(items_df["item_id"].astype(str))
+    item_id_to_idx = {iid: i for i, iid in enumerate(item_ids)}
+    idx_to_item_id = {i: iid for iid, i in item_id_to_idx.items()}
+
+    # Carrega avaliações
+    try:
+        # avaliações: formato u.data (user\titem\trating\ttimestamp) — ler com sep='\t'
+        eval_df = pd.read_csv(
+            EVAL_CSV,
+            sep='\t',
+            names=["usuario_id", "item_id", "nota", "timestamp"],
+            encoding='latin-1',
+            engine='python'
+        )
+    except Exception:
+        # se não existir, cria um df vazio com colunas esperadas
+        eval_df = pd.DataFrame(columns=["usuario_id", "item_id", "nota"])
+
+    # normaliza tipos
+    eval_df["usuario_id"] = eval_df["usuario_id"].astype(str)
+    eval_df["item_id"] = eval_df["item_id"].astype(str)
+
+load_data()
+
+def build_item_corpus(df: pd.DataFrame):
+    # Concatena campos relevantes em um único texto para TF-IDF
+    # aumentar peso do título repetindo-o algumas vezes para reforçar sua importância
+    # incluir genre_tokens (tokens prefixados) para dar peso claro a gênero
+    # limpeza básica de campos
+    def _clean_tags(t):
+        try:
+            if not isinstance(t, str):
+                return ""
+            # separar por vírgula ou pipe ou espaço
+            parts = [p.strip() for p in re.split('[,|/\\;]', t) if p.strip()]
+            return " ".join(parts)
+        except Exception:
+            return str(t)
+
+    import re
+    texts = ((df["nome"].fillna("") + " ") * TITLE_REPEAT +
+             df.get("genre_tokens", pd.Series([""]*len(df))).fillna("") + " " +
+             df.get("year_token", pd.Series([""]*len(df))).fillna("") + " " +
+             df["tags"].fillna("").apply(_clean_tags) + " " +
+             df["descricao"].fillna("")) .astype(str)
+    # limpar strings: pode-se adicionar preprocess se desejar
+    return texts.tolist()
+
+def fit_vectorizer():
+    global tfidf, item_vectors, USE_SBERT
+    corpus = build_item_corpus(items_df)
+    # Option: use SBERT embeddings; optionally concat TF-IDF + SBERT
+    if USE_SBERT:
+        try:
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(SBERT_MODEL)
+            # encode returns numpy array (n_items, dim)
+            embeddings = model.encode(corpus, show_progress_bar=False, convert_to_numpy=True, batch_size=32)
+            emb_norm = sk_normalize(embeddings, norm='l2', axis=1)
+            # build TF-IDF as well if we will concat
+            if CONCAT_SBERT:
+                tfidf = TfidfVectorizer(max_features=8000, stop_words=None, ngram_range=(1,1), sublinear_tf=True, min_df=1)
+                X = tfidf.fit_transform(corpus)  # sparse (n_items, n_features)
+                try:
+                    X_dense = X.toarray()
+                except Exception:
+                    X_dense = np.asarray(X.todense())
+                X_norm = sk_normalize(X_dense, norm='l2', axis=1)
+                # concatenar e normalizar vetor final
+                concat = np.hstack([X_norm, emb_norm])
+                item_vectors = sk_normalize(concat, norm='l2', axis=1)
+            else:
+                item_vectors = emb_norm
+        except Exception:
+            # if SBERT fails for any reason, fall back to TF-IDF
+            USE_SBERT = False
+    if not USE_SBERT:
+        # opção: concatenar TF-IDF word + char_wb
+        if CONCAT_WORD_CHAR_TFIDF:
+            # word-level TF-IDF (unigrams+bigrams)
+            tfidf_word = TfidfVectorizer(max_features=WORD_MAX_FEATURES, stop_words=None, analyzer='word', ngram_range=(1,2), sublinear_tf=True, min_df=1)
+            Xw = tfidf_word.fit_transform(corpus)
+            # char-level TF-IDF (char_wb 3-5)
+            tfidf_char = TfidfVectorizer(max_features=CHAR_MAX_FEATURES, stop_words=None, analyzer='char_wb', ngram_range=(3,5), sublinear_tf=True, min_df=1)
+            Xc = tfidf_char.fit_transform(corpus)
+            try:
+                Xw_dense = Xw.toarray()
+            except Exception:
+                Xw_dense = np.asarray(Xw.todense())
+            try:
+                Xc_dense = Xc.toarray()
+            except Exception:
+                Xc_dense = np.asarray(Xc.todense())
+            Xw_norm = sk_normalize(Xw_dense, norm='l2', axis=1)
+            Xc_norm = sk_normalize(Xc_dense, norm='l2', axis=1)
+            concat = np.hstack([Xw_norm, Xc_norm])
+            item_vectors = sk_normalize(concat, norm='l2', axis=1)
+            # keep last tfidf reference as word tfidf
+            tfidf = tfidf_word
+        else:
+            # usar unigrams e incluir termos raros (min_df configurável)
+            tfidf = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words=None, analyzer='word', ngram_range=(1,1), sublinear_tf=True, min_df=TFIDF_MIN_DF)
+            X = tfidf.fit_transform(corpus)  # sparse (n_items, n_features)
+            # Usar vetores TF-IDF normalizados por linha (sem LSA) — manter representações de conteúdo
+            try:
+                # normalizar cada vetor de item (linha) para norma L2
+                item_vectors = sk_normalize(X, norm='l2', axis=1)
+            except Exception:
+                # se normalização falhar, manter matriz TF-IDF crua
+                item_vectors = X
+    # compute item popularity (normalized count of positive ratings) to use as a small boost
+    global item_popularity
+    try:
+        pos_counts = eval_df[eval_df["nota"] >= POSITIVE_RATING_THRESHOLD].groupby("item_id").size()
+        counts = [pos_counts.get(iid, 0) for iid in item_ids]
+        arr = np.array(counts, dtype=float)
+        if arr.max() > 0:
+            item_popularity = arr / arr.max()
+        else:
+            item_popularity = np.zeros(len(item_ids), dtype=float)
+    except Exception:
+        item_popularity = np.zeros(len(item_ids), dtype=float)
+
+    # após construir item_vectors, também ajustar componente colaborativa
+    try:
+        # somente treinar componente colaborativa se o blend estiver ativo (collab_beta > 0)
+        if collab_beta and collab_beta > 0.0:
+            fit_collaborative()
+    except Exception:
+        # se falhar, manter collab desabilitada (None)
+        pass
 
 
-def gerar_recomendacoes(usuario_id: int, n_recomendacoes: int = 5):
-    if usuario_id not in user_id_to_index:
-        return {"erro": f"Usuário {usuario_id} não encontrado no dataset."}
+def fit_collaborative(k: int = None):
+    """Treina um modelo SVD simples sobre a matriz usuário-item (ratings) e popula
+    user_factors e item_factors_collab."""
+    global user_ids, user_id_to_idx, user_factors, item_factors_collab, collab_k
+    if k is None:
+        k = collab_k
+    # precisa de eval_df
+    if eval_df is None or eval_df.empty:
+        user_factors = None
+        item_factors_collab = None
+        return
+    # construir mapeamentos
+    user_ids = list(eval_df["usuario_id"].astype(str).unique())
+    user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+    n_users = len(user_ids)
+    n_items = len(item_ids)
+    if n_users == 0 or n_items == 0:
+        user_factors = None
+        item_factors_collab = None
+        return
 
-    uidx = user_id_to_index[usuario_id]
-    sims = user_sim_matrix[uidx]
-    
-    user_ratings = user_matrix[uidx]
-    
-    numerador = user_matrix.T.dot(sims)
-    denominador = np.sum(np.abs(sims)) + 1e-9
-    scores_est = numerador / denominador
-    
-    movie_ids = user_item.columns.to_numpy()
-    nao_vistos_mask = (user_ratings == 0)
-    candidatos_ids = movie_ids[nao_vistos_mask]
-    candidatos_scores = scores_est[nao_vistos_mask]
+    # montar matriz densa (n_users x n_items) — ml-100k é pequeno, denso aceitável
+    R = np.zeros((n_users, n_items), dtype=float)
+    for _, row in eval_df.iterrows():
+        u = str(row["usuario_id"])
+        iid = str(row["item_id"])
+        if u in user_id_to_idx and iid in item_id_to_idx:
+            ui = user_id_to_idx[u]
+            ii = item_id_to_idx[iid]
+            try:
+                R[ui, ii] = float(row.get("nota", 0.0))
+            except Exception:
+                R[ui, ii] = 0.0
 
-    idx_sorted = np.argsort(-candidatos_scores)
-    top_idx = idx_sorted[:n_recomendacoes]
+    # centrar por usuário (remover média) ajuda SVD
+    user_means = np.true_divide(R.sum(axis=1), (R != 0).sum(axis=1) + 1e-9)
+    R_centered = R - user_means[:, np.newaxis]
+    # preencher zeros (não-avaliações) com 0 (já estão) — SVD lidará com isso
 
-    resultado = []
-    for i in top_idx:
-        mid = int(candidatos_ids[i])
-        sc = float(candidatos_scores[i])
-        row = movies[movies["movie_id"] == mid]
-        if not row.empty:
-            row = row.iloc[0]
-            resultado.append({
-                "movie_id": mid,
-                "titulo": row["titulo"],
-                "score": float(round(sc, 3)),
-                "ano": int(row["ano"]) if not pd.isna(row["ano"]) else None
-            })
-    return resultado
+    # preferir Surprise SVD quando disponível e configurado
+    if collab_method == 'surprise' and _HAS_SURPRISE:
+        try:
+            # Surprise espera colunas user,item,rating em dataframe
+            df = eval_df[["usuario_id", "item_id", "nota"]].copy()
+            df["usuario_id"] = df["usuario_id"].astype(str)
+            df["item_id"] = df["item_id"].astype(str)
+            reader = Reader(rating_scale=(df["nota"].min(), df["nota"].max()))
+            data = Dataset.load_from_df(df[["usuario_id", "item_id", "nota"]], reader)
+            trainset = data.build_full_trainset()
+            n_comp = min(k, trainset.n_users - 1, trainset.n_items - 1) if (trainset.n_users > 1 and trainset.n_items > 1) else 0
+            if n_comp <= 0:
+                user_factors = None
+                item_factors_collab = None
+                return
+            algo = SurpriseSVD(n_factors=n_comp, random_state=42)
+            algo.fit(trainset)
+            # build user mapping and factors
+            user_ids = [trainset.to_raw_uid(i) for i in range(trainset.n_users)]
+            user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+            user_factors = algo.pu  # shape (n_users_train, n_comp)
+            # build item_factors aligned to backend.item_ids ordering
+            item_factors_collab = np.zeros((len(item_ids), n_comp), dtype=float)
+            for inner_i in range(trainset.n_items):
+                raw_iid = trainset.to_raw_iid(inner_i)
+                if raw_iid in item_id_to_idx:
+                    idx = item_id_to_idx[raw_iid]
+                    item_factors_collab[idx, :] = algo.qi[inner_i]
+            collab_k = n_comp
+            return
+        except Exception:
+            # se Surprise falhar, cair para SVD tradicional
+            pass
 
-def calcular_acuracia(usuario_id: int, n_recomendacoes: int):
-    if usuario_id not in user_id_to_index:
-        return {"erro": f"Usuário {usuario_id} não encontrado no dataset."}
+    n_comp = min(k, n_users - 1, n_items - 1) if (n_users > 1 and n_items > 1) else 0
+    if n_comp <= 0:
+        user_factors = None
+        item_factors_collab = None
+        return
 
-    user_ratings_df = ratings[ratings['user_id'] == usuario_id]
-    filmes_gostados = user_ratings_df[user_ratings_df['rating'] >= 4]['movie_id'].tolist()
-    
-    if len(filmes_gostados) < 4:
-        return {"erro": "Usuário não tem avaliações positivas suficientes para o teste (mínimo 4 com nota >= 4)."}
-    
-    np.random.shuffle(filmes_gostados)
-    meio = len(filmes_gostados) // 2
-    # teste_ids são os filmes que vamos "esconder"
-    teste_ids = filmes_gostados[meio:]
+    svd = TruncatedSVD(n_components=n_comp, random_state=42)
+    user_factors = svd.fit_transform(R_centered)  # shape (n_users, n_comp)
+    # components_ : shape (n_comp, n_items) -> item_factors: (n_items, n_comp)
+    item_factors_collab = svd.components_.T
+    collab_k = n_comp
 
-    # --- INÍCIO DA CORREÇÃO ---
-    # Em vez de remover os filmes de teste de TODO o dataset,
-    # criamos uma cópia e removemos as avaliações APENAS do utilizador-alvo.
-    
-    # 1. Copiar o dataframe de ratings original
-    ratings_temp = ratings.copy()
-    
-    # 2. Criar uma máscara para encontrar as avaliações a serem escondidas
-    mask = (ratings_temp['user_id'] == usuario_id) & (ratings_temp['movie_id'].isin(teste_ids))
-    
-    # 3. Criar o conjunto de treino temporário removendo apenas essas avaliações
-    ratings_treino = ratings_temp[~mask]
-    # --- FIM DA CORREÇÃO ---
+fit_vectorizer()
 
-    # Construir um modelo temporário com os dados de treino
-    modelo_temp_item = ratings_treino.pivot_table(index="user_id", columns="movie_id", values="rating").fillna(0)
-    # Alinhar as colunas com o modelo original para garantir a mesma forma
-    modelo_temp_item = modelo_temp_item.reindex(columns=user_item.columns, fill_value=0)
-    modelo_temp_sim = cosine_similarity(modelo_temp_item.values)
-    
-    # Gerar recomendações com o modelo temporário
-    uidx = user_id_to_index[usuario_id]
-    sims = modelo_temp_sim[uidx]
-    
-    matriz_temp_valores = modelo_temp_item.values
-    numerador = matriz_temp_valores.T.dot(sims)
-    denominador = np.sum(np.abs(sims)) + 1e-9
-    scores_est = numerador / denominador
-    
-    # Encontrar filmes que o utilizador não viu NO MODELO TEMPORÁRIO
-    nao_vistos_mask = (matriz_temp_valores[uidx] == 0)
-    candidatos_ids = modelo_temp_item.columns.to_numpy()[nao_vistos_mask]
-    candidatos_scores = scores_est[nao_vistos_mask]
-    
-    idx_sorted = np.argsort(-candidatos_scores)
-    recomendacoes_ids = candidatos_ids[idx_sorted[:n_recomendacoes]]
-    
-    # Calcular acertos
-    acertos = len(set(recomendacoes_ids) & set(teste_ids))
-    
-    # --- INÍCIO DA CORREÇÃO ---
-    # O frontend espera uma chave chamada 'acuracia'.
-    # A métrica que corresponde a (acertos / n_recomendacoes) é a Precisão.
-    # Vamos calcular e adicionar a chave 'acuracia' à resposta.
-    
-    # Cálculo da Precisão (o que o frontend chama de acurácia)
-    precisao_valor = acertos / n_recomendacoes if n_recomendacoes > 0 else 0
-    
-    # Cálculo do Recall
-    recall_valor = acertos / len(teste_ids) if len(teste_ids) > 0 else 0
 
+# --- perfil do usuário e recomendação ---
+def user_profile_from_item_ids(item_ids_list: List[str], ratings_map: Optional[dict] = None):
+    """
+    Constrói o perfil do usuário a partir de uma lista de item_ids.
+    Se ratings_map for fornecido (dicionário item_id -> rating), os vetores dos itens
+    serão ponderados pela nota correspondente antes de somar.
+    """
+    idxs = [item_id_to_idx[iid] for iid in item_ids_list if iid in item_id_to_idx]
+    if not idxs:
+        return None
+    vectors = item_vectors[idxs]
+    try:
+        # aplicar pesos quando ratings_map fornecido
+        if ratings_map:
+            # construir vetor de pesos na ordem dos idxs
+            weights = [float(ratings_map.get(backend_id, 1.0)) if ratings_map.get(backend_id, None) is not None else 1.0 for backend_id in [idx_to_item_id[i] for i in idxs]]
+            w = np.array(weights, dtype=float)
+            # tratar vetores densos (numpy) e esparsos
+            if isinstance(vectors, np.ndarray):
+                # vectors shape (n_items, n_features)
+                weighted = (vectors.T * w).T
+                summed = weighted.sum(axis=0)
+            else:
+                dense = vectors.toarray()
+                weighted = (dense.T * w).T
+                summed = weighted.sum(axis=0)
+        else:
+            if isinstance(vectors, np.ndarray):
+                summed = vectors.sum(axis=0)
+            else:
+                summed = vectors.sum(axis=0)
+
+        # ensure ndarray 2D
+        if hasattr(summed, "toarray"):
+            arr = np.asarray(summed.toarray()).reshape(1, -1)
+        else:
+            arr = np.asarray(summed).reshape(1, -1)
+        arr = sk_normalize(arr, norm='l2')
+        return arr
+    except Exception:
+        # fallback: média sem pesos
+        profile = vectors.mean(axis=0)
+        if hasattr(profile, "toarray"):
+            return np.asarray(profile.toarray())
+        return np.asarray(profile)
+
+def recommend_for_profile(profile_vector, top_n=10, exclude_ids: Optional[List[str]] = None, usuario_id: Optional[str] = None):
+    # profile_vector: (1, n_features)
+    if profile_vector is None:
+        return []
+    # sklearn does not accept np.matrix; convert to ndarray
+    try:
+        if hasattr(profile_vector, "toarray"):
+            pv = profile_vector.toarray()
+        else:
+            pv = np.asarray(profile_vector)
+        # ensure 2D shape (1, n_features)
+        if pv.ndim == 1:
+            pv = pv.reshape(1, -1)
+    except Exception:
+        pv = np.asarray(profile_vector)
+
+    sims = cosine_similarity(pv, item_vectors).flatten()  # len = n_items
+    # combine similarity with item popularity to slightly favor well-liked items
+    try:
+        if item_popularity is not None:
+            alpha = 0.0  # default: não misturar popularidade (grid mostrou beta alto com alpha baixo é melhor)
+            sims = (1 - alpha) * sims + alpha * item_popularity
+    except Exception:
+        pass
+
+    # componente colaborativa: se usuario_id conhecido e modelo collab treinado
+    try:
+        if usuario_id is not None and item_factors_collab is not None and user_id_to_idx:
+            uid = str(usuario_id)
+            if uid in user_id_to_idx:
+                uidx = user_id_to_idx[uid]
+                # user_factors shape (n_users, k), item_factors_collab shape (n_items, k)
+                cf_scores = np.dot(user_factors[uidx], item_factors_collab.T)
+                # normalizar CF scores
+                if np.ptp(cf_scores) > 0:
+                    cf_scores = (cf_scores - cf_scores.min()) / (cf_scores.max() - cf_scores.min())
+                else:
+                    cf_scores = np.zeros_like(cf_scores)
+                # blend content and collaborative
+                beta = collab_beta
+                sims = (1 - beta) * sims + beta * cf_scores
+    except Exception:
+        pass
+    # monta DataFrame temporário
+    df = pd.DataFrame({
+        "item_id": [idx_to_item_id[i] for i in range(len(sims))],
+        "score": sims
+    })
+    if exclude_ids:
+        df = df[~df["item_id"].isin(exclude_ids)]
+    df = df.sort_values("score", ascending=False).head(top_n)
+    # inclui nome
+    merged = df.merge(items_df, how="left", left_on="item_id", right_on="item_id")
+    results = merged[["item_id", "nome", "score"]].to_dict(orient="records")
+    return results
+
+# --- avaliação (Precision/Recall/F1) ---
+def evaluate_global():
+    # Para cada usuário, separa itens "positivos" (nota >= threshold) em train/test,
+    # cria perfil com train e recomenda top-k (k = len(test) or fixed) e calcula métricas.
+    if eval_df.empty:
+        return {"precision": None, "recall": None, "f1": None, "users_evaluated": 0}
+    users = eval_df["usuario_id"].unique()
+    precisions = []
+    recalls = []
+    f1s = []
+    evaluated_users = 0
+    for u in users:
+        user_ratings = eval_df[eval_df["usuario_id"] == u]
+        # itens positivos
+        pos = user_ratings[user_ratings["nota"] >= POSITIVE_RATING_THRESHOLD]["item_id"].astype(str).unique().tolist()
+        if len(pos) < 2:  # precisa de pelo menos 2 para fazer split train/test
+            continue
+        train, test = train_test_split(pos, test_size=TEST_SIZE_PER_USER, random_state=42)
+        profile = user_profile_from_item_ids(train)
+        if profile is None:
+            continue
+        # recomendar top K onde K = len(test) * 2 (heurística) ou ao menos 1
+        k = max(1, len(test))
+        # passar usuario_id para que a parte colaborativa seja usada na recomendação
+        recs = recommend_for_profile(profile, top_n=k*2, exclude_ids=train, usuario_id=u)
+        rec_ids = [r["item_id"] for r in recs]
+        # calcula métricas simples
+        hits = len(set(rec_ids).intersection(set(test)))
+        precision = hits / len(rec_ids) if rec_ids else 0.0
+        recall = hits / len(test) if test else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+        evaluated_users += 1
+
+    if evaluated_users == 0:
+        return {"precision": None, "recall": None, "f1": None, "users_evaluated": 0}
     return {
-        "acertos": acertos,
-        "total_recomendado": n_recomendacoes,
-        "total_no_teste": len(teste_ids),
-        "acuracia": round(precisao_valor, 3), # Chave adicionada para o frontend
-        "precisao": round(precisao_valor, 3), # Mantendo o nome técnico correto
-        "recall": round(recall_valor, 3)
+        "precision": float(np.mean(precisions)),
+        "recall": float(np.mean(recalls)),
+        "f1": float(np.mean(f1s)),
+        "users_evaluated": int(evaluated_users)
     }
-    # --- FIM DA CORREÇÃO ---
 
+# --- Pydantic models ---
+class RecommendRequest(BaseModel):
+    usuario_id: Optional[str] = None
+    n: Optional[int] = 10
+    use_favorites: Optional[bool] = False
+    favorite_item_ids: Optional[List[str]] = None  # se use_favorites=True, usa essa lista
 
-# ===== Endpoints =====
+# --- Endpoints ---
+@app.get("/itens")
+def get_itens():
+    # Retorna os itens básicos
+    out = items_df[["item_id", "nome", "categoria", "tags", "descricao"]].to_dict(orient="records")
+    return {"count": len(out), "itens": out}
+
+@app.get("/usuarios")
+def get_usuarios():
+    if eval_df.empty:
+        return {"count": 0, "usuarios": []}
+    user_stats = eval_df.groupby("usuario_id").agg({'item_id': 'count'}).reset_index().rename(columns={'item_id': 'n_avaliacoes'})
+    return {"count": len(user_stats), "usuarios": user_stats.to_dict(orient="records")}
 
 @app.post("/recomendar")
-def recomendar(req: RequisicaoRecomendacao):
-    return gerar_recomendacoes(req.usuario_id, req.n_recomendacoes)
+def recomendar(req: RecommendRequest):
+    # se use_favorites está True, constrói perfil a partir de favorite_item_ids
+    if req.use_favorites:
+        favs = req.favorite_item_ids or []
+        profile = user_profile_from_item_ids(favs)
+        recs = recommend_for_profile(profile, top_n=req.n, exclude_ids=favs)
+        return {"usuario_id": req.usuario_id, "n": req.n, "recommendations": recs}
+    # caso contrário, tenta montar perfil a partir de avaliacoes do usuario
+    if not req.usuario_id:
+        raise HTTPException(status_code=400, detail="usuario_id obrigatório quando use_favorites=False")
+    u = str(req.usuario_id)
+    if eval_df.empty or u not in eval_df["usuario_id"].astype(str).unique():
+        raise HTTPException(status_code=404, detail=f"usuario_id {u} não encontrado nas avaliações")
+    user_ratings = eval_df[eval_df["usuario_id"].astype(str) == u]
+    pos_items = user_ratings[user_ratings["nota"] >= POSITIVE_RATING_THRESHOLD]["item_id"].astype(str).unique().tolist()
+    if not pos_items:
+        # sem itens positivos: retorna itens populares (por nota média) como fallback
+        # fallback: itens mais avaliados positivamente globalmente
+        if eval_df.empty:
+            fallback = items_df.head(req.n)[["item_id", "nome"]].to_dict(orient="records")
+            return {"usuario_id": u, "n": req.n, "recommendations": [{"item_id": r["item_id"], "nome": r["nome"], "score": None} for r in fallback]}
+        pos_global = eval_df[eval_df["nota"] >= POSITIVE_RATING_THRESHOLD].groupby("item_id").size().sort_values(ascending=False).head(req.n).index.tolist()
+        recs = [{"item_id": iid, "nome": items_df[items_df["item_id"] == iid]["nome"].values[0], "score": None} for iid in pos_global]
+        return {"usuario_id": u, "n": req.n, "recommendations": recs}
 
-# Alterado o nome do endpoint para ser mais descritivo
-@app.post("/calcular-acuracia-usuario")
-def endpoint_calcular_acuracia(req: RequisicaoRecomendacao):
-    # n_recomendacoes aqui é o "k" do Precision@k/Recall@k
-    return calcular_acuracia(req.usuario_id, req.n_recomendacoes)
+    # construir mapa item->rating para ponderar o perfil pelo quanto o usuário gostou
+    ratings_map = {row["item_id"]: row["nota"] for _, row in user_ratings.iterrows()}
+    profile = user_profile_from_item_ids(pos_items, ratings_map=ratings_map)
+    recs = recommend_for_profile(profile, top_n=req.n, exclude_ids=pos_items, usuario_id=u)
+    return {"usuario_id": u, "n": req.n, "recommendations": recs}
 
-@app.post("/avaliar-filme")
-def avaliar_filme(req: RequisicaoAvaliacao):
-    global ratings
-    nova_avaliacao = pd.DataFrame([{"user_id": req.usuario_id, "movie_id": req.movie_id, "rating": req.rating, "timestamp": int(time.time())}])
-    
-    # Evitar duplicados se o utilizador reavaliar um filme
-    ratings = ratings[~((ratings['user_id'] == req.usuario_id) & (ratings['movie_id'] == req.movie_id))]
-    ratings = pd.concat([ratings, nova_avaliacao], ignore_index=True)
-    
-    # O modelo precisa de ser reconstruído com os novos dados
-    construir_modelo()
-    return {"status": "sucesso", "mensagem": "Avaliação registada e modelo atualizado."}
+@app.get("/avaliacao")
+def avaliacao():
+    metrics = evaluate_global()
+    return metrics
+
+# endpoint para re-treinar vetorizador (útil se alterar filmes.csv)
+class RebuildRequest(BaseModel):
+    title_repeat: Optional[int] = None
+    tfidf_max_features: Optional[int] = None
+    tfidf_min_df: Optional[int] = None
+
+
+@app.post("/rebuild_vectors")
+def rebuild_vectors(req: RebuildRequest = None):
+    try:
+        # permite sobrepor parâmetros TF-IDF rapidamente via body JSON
+        global TITLE_REPEAT, TFIDF_MAX_FEATURES, TFIDF_MIN_DF
+        if req is not None:
+            if req.title_repeat is not None:
+                TITLE_REPEAT = int(req.title_repeat)
+            if req.tfidf_max_features is not None:
+                TFIDF_MAX_FEATURES = int(req.tfidf_max_features)
+            if req.tfidf_min_df is not None:
+                TFIDF_MIN_DF = int(req.tfidf_min_df)
+        load_data()
+        fit_vectorizer()
+        return {"status": "ok", "n_items": len(item_ids)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)
