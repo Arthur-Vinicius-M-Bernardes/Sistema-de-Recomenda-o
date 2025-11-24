@@ -25,12 +25,11 @@ Este projeto implementa um sistema de recomendação baseado em **filtragem por 
 > Base de dados principal: adaptação do **MovieLens 100K** e arquivos auxiliares convertidos (pasta `converted_data/`).
 
 ## Principais Recursos
-- Vetorização de conteúdo com **TF-IDF** (opções para expansão: TF-IDF char, concatenações ou SBERT).
-- Perfil do usuário construído por itens positivos (nota >= 4) ou favoritos selecionados manualmente.
-- Similaridade via **Cosseno** para ranking.
+- Vetorização de conteúdo com **TF-IDF** (palavras + opção caractere) e normalização L2.
+- Perfil do usuário construído por itens positivos (nota >= 4) ou favoritos selecionados manualmente (com penalização de avaliações negativas).
+- Similaridade via **Cosseno** para ranking + pequeno fator de popularidade.
 - Endpoint de métricas globais: Precision / Recall / F1.
-- Mecanismo de reconstrução dos vetores (`/rebuild_vectors`) com ajuste rápido de hiperparâmetros.
-- Estrutura preparada para futura mistura com filtragem colaborativa (SVD / Surprise) via parâmetro interno de blending.
+- Mecanismo de reconstrução dos vetores (`/rebuild_vectors`) com ajuste rápido de hiperparâmetros relevantes (repetições, min_df, n-gram, limites de features).
 
 ## Arquitetura
 | Camada | Tecnologia | Responsabilidade |
@@ -54,10 +53,10 @@ Ao carregar, o backend:
 
 ## Abordagem de Recomendação
 1. Constrói um corpus textual por item (título repetido para maior peso + tokens de gênero + ano + tags limpas + descrição).
-2. Aplica **TF-IDF** e normaliza vetores (L2).
-3. Cria perfil do usuário somando (ou ponderando pelas notas) os vetores dos itens positivos.
-4. Calcula similaridade do perfil com todos os itens (Cosine) e ordena.
-5. (Opcional interno) Mistura com escore colaborativo se habilitado (`collab_beta > 0`).
+2. Vetorização principal: **TF-IDF** combinando análise de palavras (unigramas e bigramas) e caractere (char_wb 3–5) com `min_df = 1` (mantém termos raros potencialmente discriminativos), remoção de stopwords básicas e normalização L2. A definição de `min_df = 1` faz parte do cálculo padrão para ampliar recall sem sacrificar a precisão observada.
+3. Cria perfil do usuário somando (ou ponderando pelas notas) os vetores dos itens positivos (e penalizando itens avaliados negativamente) seguido de normalização.
+4. Calcula similaridade do perfil com todos os itens (Cosine) e ordena; aplica leve mistura de popularidade (`POP_ALPHA = 0.05`) para favorecer itens bem recebidos.
+5. (Somente conteúdo – sem mistura colaborativa neste escopo simplificado).
 
 ### Métrica de Similaridade
 `similaridade = cos(v_perfil, v_item)` → valores entre 0 e 1 (não-negativos, pois TF-IDF). Quanto mais próximo de 1, maior alinhamento semântico.
@@ -143,8 +142,19 @@ python -m streamlit run frontend.py
 ```
 Acesse: http://localhost:8501
 
+Se o backend estiver em outra porta/host, você pode:
+- Ajustar no próprio app (barra lateral → BACKEND URL), ou
+- Definir antes de iniciar o Streamlit:
+
+```powershell
+$env:BACKEND_URL = "http://localhost:8000"  # altere se usar outra porta/host
+python -m streamlit run frontend.py
+```
+
 ## Avaliação e Métricas
 Endpoint `/avaliacao` calcula métricas offline:
 - **Precision**: proporção de recomendações que são relevantes.
 - **Recall**: cobertura dos itens relevantes do usuário.
 - **F1**: equilíbrio entre precision e recall.
+
+A configuração corrente (min_df=1 + combinação word/char + leve prior de popularidade) mostrou bom equilíbrio entre precisão e recall em testes internos.
