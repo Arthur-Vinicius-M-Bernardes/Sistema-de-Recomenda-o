@@ -1,96 +1,150 @@
-Sistema de Recomendação de Filmes - Filtragem Baseada em Conteúdo
-Este projeto implementa um sistema de recomendação de filmes utilizando Filtragem Baseada em Conteúdo. O sistema analisa as características textuais dos filmes (título, gênero, tags, descrição) para sugerir novos itens similares ao perfil de preferências do usuário.
+## Sumário
+1. [Visão Geral](#-visão-geral)
+2. [Principais Recursos](#-principais-recursos)
+3. [Arquitetura](#-arquitetura)
+4. [Dados e Preparação](#-dados-e-preparação)
+5. [Abordagem de Recomendação](#-abordagem-de-recomendação)
+6. [API (Backend FastAPI)](#-api-backend-fastapi)
+7. [Frontend (Streamlit)](#-frontend-streamlit)
+8. [Instalação e Execução](#-instalação-e-execução)
+9. [Avaliação e Métricas](#-avaliação-e-métricas)
+10. [Estrutura do Projeto](#-estrutura-do-projeto)
+11. [Melhorias Futuras](#-melhorias-futuras)
+12. [Contribuição](#-contribuição)
+13. [Licença](#-licença)
 
-1. Objetivo do Sistema
-O objetivo principal é desenvolver e avaliar um motor de recomendação que sugira itens relevantes ao usuário baseando-se exclusivamente nos atributos de conteúdo dos itens, sem utilizar filtragem colaborativa (histórico de outros usuários) como fator principal. O projeto inclui uma API (Backend) e uma interface web interativa (Frontend), além de um módulo de avaliação de métricas (Precision, Recall e F1-Score).
+---
 
+## Visão Geral
+Este projeto implementa um sistema de recomendação baseado em **filtragem por conteúdo**. Em vez de usar o comportamento de múltiplos usuários (filtragem colaborativa), ele se apoia nos próprios atributos dos filmes para encontrar similaridade: título, gêneros tokenizados, ano, tags e descrição.
 
-2. Cenário e Dados
-O cenário escolhido foi Filmes. Recomendações são relevantes neste cenário devido à vasta quantidade de opções disponíveis, o que dificulta a escolha manual pelo usuário.
+É composto por:
+- Uma **API (FastAPI)** que expõe endpoints para itens, usuários, recomendações, avaliação e reconstrução dos vetores.
+- Um **frontend (Streamlit)** simples para interação, seleção de favoritos e visualização dos resultados.
 
-O sistema requer dois arquivos CSV na raiz do projeto:
+> Base de dados principal: adaptação do **MovieLens 100K** e arquivos auxiliares convertidos (pasta `converted_data/`).
 
-filmes.csv: Contém item_id, title, generos, tags e descricao (atributos de conteúdo).
+## Principais Recursos
+- Vetorização de conteúdo com **TF-IDF** (opções para expansão: TF-IDF char, concatenações ou SBERT).
+- Perfil do usuário construído por itens positivos (nota >= 4) ou favoritos selecionados manualmente.
+- Similaridade via **Cosseno** para ranking.
+- Endpoint de métricas globais: Precision / Recall / F1.
+- Mecanismo de reconstrução dos vetores (`/rebuild_vectors`) com ajuste rápido de hiperparâmetros.
+- Estrutura preparada para futura mistura com filtragem colaborativa (SVD / Surprise) via parâmetro interno de blending.
 
-aval.csv: Contém usuario_id, item_id, nota (usado apenas para criar o perfil do usuário e validar métricas).
+## Arquitetura
+| Camada | Tecnologia | Responsabilidade |
+|--------|------------|------------------|
+| Backend | FastAPI | Endpoints, carregamento de dados, vetorização, recomendações, métricas |
+| Frontend | Streamlit | Interface para busca, seleção de favoritos e visualização das recomendações |
+| Modelo | scikit-learn | TF-IDF + Similaridade do Cosseno |
+| Dados | MovieLens / CSV | Fonte de itens e avaliações |
 
-3. Arquitetura e Tecnologias
-Backend: Python com FastAPI. Responsável pela lógica de recomendação, vetorização e cálculo de métricas.
+## Dados e Preparação
+Arquivos esperados na raiz:
+- `filmes.csv` – catálogo de filmes; aceita formato original `u.item` (pipe `|`) ou versão já convertida.
+- `aval.csv` – avaliações (`usuario_id`, `item_id`, `nota` [, `timestamp`]). Se ausente, o sistema funciona apenas com favoritos.
 
-Frontend: Python com Streamlit. Interface para interação com o usuário e visualização dos resultados.
+Ao carregar, o backend:
+1. Renomeia colunas para um formato canônico (`item_id`, `nome`, `descricao`, `tags`, `categoria`).
+2. Normaliza títulos (`"Matrix, The" -> "The Matrix"`).
+3. Constrói tokens de gênero: `Action, Drama -> genre_Action genre_Drama`.
+4. Extrai ano: gera `year_YYYY` quando possível.
+5. Prepara campo composto para vetorização.
 
-Bibliotecas Principais: scikit-learn (Machine Learning), pandas (Manipulação de dados), numpy.
+## Abordagem de Recomendação
+1. Constrói um corpus textual por item (título repetido para maior peso + tokens de gênero + ano + tags limpas + descrição).
+2. Aplica **TF-IDF** e normaliza vetores (L2).
+3. Cria perfil do usuário somando (ou ponderando pelas notas) os vetores dos itens positivos.
+4. Calcula similaridade do perfil com todos os itens (Cosine) e ordena.
+5. (Opcional interno) Mistura com escore colaborativo se habilitado (`collab_beta > 0`).
 
-4. Como Rodar o Projeto
-Pré-requisitos
-Certifique-se de ter o Python instalado e as bibliotecas necessárias:
+### Métrica de Similaridade
+`similaridade = cos(v_perfil, v_item)` → valores entre 0 e 1 (não-negativos, pois TF-IDF). Quanto mais próximo de 1, maior alinhamento semântico.
 
-Bash
+### Perfil do Usuário
+- Com avaliações: soma ponderada (peso = nota) → normalização.
+- Sem avaliações (modo favoritos): soma simples dos vetores selecionados.
 
+## API (Backend FastAPI)
+Base URL padrão: `http://localhost:8000`
+
+| Método | Rota | Descrição |
+|--------|------|-----------|
+| GET | `/itens` | Lista itens do catálogo |
+| GET | `/usuarios` | Lista usuários e nº de avaliações |
+| POST | `/recomendar` | Gera recomendações (por usuário ou favoritos) |
+| GET | `/avaliacao` | Retorna métricas globais (precision/recall/f1) |
+| POST | `/rebuild_vectors` | Recarrega dados e refaz vetorização |
+
+### Exemplo: Recomendar por usuário
+```jsonc
+POST /recomendar
+{
+	"usuario_id": "42",
+	"n": 10
+}
+```
+
+### Exemplo: Recomendar usando favoritos
+```jsonc
+POST /recomendar
+{
+	"use_favorites": true,
+	"favorite_item_ids": ["50", "172", "250"],
+	"n": 8
+}
+```
+
+## Frontend (Streamlit)
+Interface simples em `frontend.py` para:
+- Seleção de usuário ou montagem manual de favoritos.
+- Visualização de recomendações ordenadas.
+- Exibição de métricas agregadas.
+
+## Instalação e Execução
+
+### 1. Clonar o repositório
+```powershell
+git clone https://github.com/Arthur-Vinicius-M-Bernardes/Sistema-de-Recomenda-o.git
+cd Sistema-de-Recomenda-o
+```
+
+Se houver erro de certificado (Windows / schannel), você pode temporariamente:
+```powershell
+git config --global http.sslVerify false
+# (Depois de clonar, recomende reativar) git config --global http.sslVerify true
+```
+
+### 2. Criar ambiente virtual (opcional, recomendado)
+```powershell
+python -m venv venv
+./venv/Scripts/Activate.ps1
+```
+
+### 3. Instalar dependências
+```powershell
+pip install -r requirements.txt
+```
+Ou manualmente:
+```powershell
 pip install fastapi uvicorn streamlit pandas scikit-learn numpy requests
-Executando o Backend
-No terminal, navegue até a pasta do projeto e execute:
+```
 
-Bash
+### 4. Iniciar Backend
+```powershell
+python -m uvicorn backend:app --reload --port 8000
+```
+Acesse: http://localhost:8000/docs
 
-uvicorn backend:app --host 0.0.0.0 --port 8000 --reload
-O backend estará rodando em http://localhost:8000.
+### 5. Iniciar Frontend
+```powershell
+python -m streamlit run frontend.py
+```
+Acesse: http://localhost:8501
 
-Executando o Frontend
-Em um novo terminal, execute:
-
-Bash
-
-streamlit run frontend.py
-O navegador abrirá automaticamente a interface do sistema.
-
-5. Implementação Técnica
-Vetorização dos Itens
-A transformação dos atributos textuais dos filmes em vetores numéricos foi realizada utilizando TF-IDF (Term Frequency-Inverse Document Frequency). O processo de construção do corpus textual para cada filme segue a seguinte lógica:
-
-Título: Repetido para aumentar seu peso relativo.
-
-Gêneros: Tokenizados especificamente (ex: genre_Action).
-
-Ano: Extraído da data de lançamento.
-
-Tags e Descrição: Concatenados e limpos.
-
-O vetorizador TfidfVectorizer gera uma matriz esparsa que é normalizada (Norma L2) para garantir que a magnitude dos vetores não influencie o cálculo de similaridade.
-
-Construção do Perfil do Usuário
-O perfil do usuário é uma representação vetorial calculada a partir dos itens que ele interagiu positivamente (nota >= 4 ou selecionados manualmente).
-
-Se houver notas: O vetor do perfil é a soma ponderada dos vetores dos filmes avaliados (onde o peso é a nota dada).
-
-Se não houver notas (apenas seleção): O vetor é a soma simples ou média dos vetores dos itens escolhidos.
-
-O vetor resultante é normalizado para manter a consistência com a matriz de itens.
-
-
-Métrica de Similaridade
-A métrica escolhida para comparar o vetor do perfil do usuário com os vetores de todos os filmes do catálogo foi a Similaridade do Cosseno. Ela mede o cosseno do ângulo entre dois vetores, resultando em um valor entre -1 e 1 (no nosso caso, entre 0 e 1 devido ao TF-IDF), onde 1 indica identidade máxima de conteúdo.
-
-6. Avaliação do Sistema (Métricas)
-O sistema possui um endpoint /avaliacao que calcula métricas de performance offline usando o dataset de avaliações (aval.csv).
-
-Metodologia de Cálculo
-Para cada usuário com pelo menos 2 avaliações positivas (nota >= 4):
-
-O histórico é dividido em Treino (80%) e Teste (20%).
-
-Um perfil é gerado usando apenas os itens de Treino.
-
-O sistema gera recomendações baseadas nesse perfil.
-
-Verifica-se quantos itens do conjunto de Teste (gabarito) apareceram nas recomendações.
-
-Interpretação dos Resultados 
-
-Precision: De todos os filmes recomendados, qual porcentagem o usuário realmente avaliou positivamente no conjunto de teste? (Indica qualidade/relevância).
-
-Recall: De todos os filmes que o usuário gosta (no teste), qual porcentagem o sistema conseguiu encontrar e recomendar? (Indica cobertura).
-
-F1-Score: Média harmônica entre Precision e Recall. É a métrica principal para balancear o compromisso entre recomendar apenas o "certo" (precisão) e encontrar "todos" os certos (recall).
-
-Resultados próximos de 0 indicam que o conteúdo textual dos filmes pode não ser suficiente para explicar o gosto do usuário ou que o dataset é esparso. Resultados mais altos indicam que o usuário tende a gostar de filmes com palavras-chave e gêneros muito similares.
+## Avaliação e Métricas
+Endpoint `/avaliacao` calcula métricas offline:
+- **Precision**: proporção de recomendações que são relevantes.
+- **Recall**: cobertura dos itens relevantes do usuário.
+- **F1**: equilíbrio entre precision e recall.
