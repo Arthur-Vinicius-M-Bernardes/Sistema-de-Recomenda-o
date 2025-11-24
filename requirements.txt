@@ -1,0 +1,11 @@
+fastapi>=0.70.0
+uvicorn[standard]>=0.15.0
+streamlit>=1.10.0
+pandas>=1.3.0
+numpy>=1.21.0
+scikit-learn>=1.0.0
+requests>=2.25.0
+
+# Optional (not required for content-only mode):
+# scikit-surprise>=1.1.0
+sentence-transformers>=2.2.2
