@@ -8,10 +8,6 @@
 7. [Frontend (Streamlit)](#-frontend-streamlit)
 8. [Instalação e Execução](#-instalação-e-execução)
 9. [Avaliação e Métricas](#-avaliação-e-métricas)
-10. [Estrutura do Projeto](#-estrutura-do-projeto)
-11. [Melhorias Futuras](#-melhorias-futuras)
-12. [Contribuição](#-contribuição)
-13. [Licença](#-licença)
 
 ---
 
@@ -158,3 +154,4 @@ Endpoint `/avaliacao` calcula métricas offline:
 - **F1**: equilíbrio entre precision e recall.
 
 A configuração corrente (min_df=1 + combinação word/char + leve prior de popularidade) mostrou bom equilíbrio entre precisão e recall em testes internos.
+
