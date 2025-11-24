@@ -8,15 +8,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize as sk_normalize
-from sklearn.decomposition import TruncatedSVD
 from typing import List, Optional
 import uvicorn
-# optional Surprise (better collaborative filtering)
-try:
-    from surprise import Dataset, Reader, SVD as SurpriseSVD
-    _HAS_SURPRISE = True
-except Exception:
-    _HAS_SURPRISE = False
+# (Suporte a Surprise/colaborativo removido: modo somente conteúdo)
 
 app = FastAPI(title="Recomendador - Filtragem por Conteúdo")
 
@@ -38,31 +32,23 @@ idx_to_item_id = {}
 tfidf = None
 item_vectors = None
 item_popularity = None
-# collaborative globals
-user_ids = []
-user_id_to_idx = {}
-user_factors = None
-item_factors_collab = None
-collab_k = 50
-
-# blending weight between content and collaborative (0..1). Higher => more CF
-# running in content-only mode by default: disable collaborative blending
-collab_beta = 0.0
-collab_method = 'svd'  # kept for reference; CF training will not run when collab_beta == 0.0
-
-# SBERT / semantic embeddings (content-only alternative)
-USE_SBERT = False
-SBERT_MODEL = 'all-MiniLM-L6-v2'  # small, fast, good quality
-# Se True, concatena TF-IDF (dense) com SBERT (dense) e normaliza o vetor final
-CONCAT_SBERT = False
+# Variáveis de filtragem colaborativa e SBERT removidas (não utilizadas)
 # Concatena TF-IDF word + TF-IDF char_wb para tentar capturar sinais distintos
-CONCAT_WORD_CHAR_TFIDF = False
-WORD_MAX_FEATURES = 4000
+CONCAT_WORD_CHAR_TFIDF = True  # habilitado para melhorar cobertura lexical
+USE_STOPWORDS = True  # remover stopwords básicas para reduzir ruído
+WORD_MAX_FEATURES = 6000
 CHAR_MAX_FEATURES = 4000
-# Parametros TF-IDF ajustáveis (padrões ótimizados encontrados)
-TITLE_REPEAT = 1
-TFIDF_MAX_FEATURES = 8000
-TFIDF_MIN_DF = 1
+# Pesos por campo para reforçar sinais mais úteis
+TITLE_REPEAT = 3
+GENRE_REPEAT = 2
+TAGS_REPEAT = 1
+DESC_REPEAT = 1
+YEAR_REPEAT = 1
+# Parametros TF-IDF ajustáveis (padrões mais robustos)
+TFIDF_MAX_FEATURES = 10000
+TFIDF_MIN_DF = 1  # ajustado (tuning) para capturar termos raros e melhorar F1 – ver seção de tuning no README
+WORD_NGRAM = (1, 2)
+POP_ALPHA = 0.05  # mistura de popularidade no ranking
 
 def load_data():
     global items_df, eval_df, item_ids, item_id_to_idx, idx_to_item_id
@@ -196,190 +182,76 @@ def build_item_corpus(df: pd.DataFrame):
         try:
             if not isinstance(t, str):
                 return ""
-            # separar por vírgula ou pipe ou espaço
-            parts = [p.strip() for p in re.split('[,|/\\;]', t) if p.strip()]
-            return " ".join(parts)
+            parts = [p.strip().lower() for p in re.split('[,|/\\;]', t) if p.strip()]
+            # remover duplicados mantendo ordem
+            seen = set()
+            dedup = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    dedup.append(p)
+            return " ".join(dedup)
         except Exception:
-            return str(t)
+            return str(t).lower()
 
     import re
-    texts = ((df["nome"].fillna("") + " ") * TITLE_REPEAT +
-             df.get("genre_tokens", pd.Series([""]*len(df))).fillna("") + " " +
-             df.get("year_token", pd.Series([""]*len(df))).fillna("") + " " +
-             df["tags"].fillna("").apply(_clean_tags) + " " +
-             df["descricao"].fillna("")) .astype(str)
+    # constrói texto com pesos por campo via repetição simples (robusta para TF-IDF)
+    # normalização simples (lowercase)
+    title_part = (df["nome"].fillna("").str.lower() + " ").astype(str)
+    genre_part = df.get("genre_tokens", pd.Series([""]*len(df))).fillna("").str.lower().astype(str) + " "
+    year_part = df.get("year_token", pd.Series([""]*len(df))).fillna("").str.lower().astype(str) + " "
+    tags_part = df["tags"].fillna("").apply(_clean_tags).astype(str) + " "
+    desc_part = df["descricao"].fillna("").str.lower().astype(str)
+
+    def repeat_text(s: pd.Series, times: int):
+        if times <= 1:
+            return s
+        return (s * times)
+
+    texts = (
+        repeat_text(title_part, TITLE_REPEAT) +
+        repeat_text(genre_part, GENRE_REPEAT) +
+        repeat_text(year_part, YEAR_REPEAT) +
+        repeat_text(tags_part, TAGS_REPEAT) +
+        repeat_text(desc_part, DESC_REPEAT)
+    ).astype(str)
     # limpar strings: pode-se adicionar preprocess se desejar
     return texts.tolist()
 
 def fit_vectorizer():
-    global tfidf, item_vectors, USE_SBERT
+    # Vetorização somente conteúdo (TF-IDF) + popularidade
+    global tfidf, item_vectors, item_popularity
     corpus = build_item_corpus(items_df)
-    # Option: use SBERT embeddings; optionally concat TF-IDF + SBERT
-    if USE_SBERT:
+    stop_words = None
+    if USE_STOPWORDS:
+        stop_words = ['a','o','os','as','de','do','da','dos','das','e','é','em','para','por','um','uma','no','na','nos','nas','com','se','que','the','of','and','in','to','for','on','at','by','an','is','it']
+    if CONCAT_WORD_CHAR_TFIDF:
+        tfidf_word = TfidfVectorizer(max_features=WORD_MAX_FEATURES, stop_words=stop_words, analyzer='word', ngram_range=WORD_NGRAM, sublinear_tf=True, min_df=TFIDF_MIN_DF)
+        Xw = tfidf_word.fit_transform(corpus)
+        tfidf_char = TfidfVectorizer(max_features=CHAR_MAX_FEATURES, analyzer='char_wb', ngram_range=(3,5), sublinear_tf=True, min_df=TFIDF_MIN_DF)
+        Xc = tfidf_char.fit_transform(corpus)
+        from scipy.sparse import hstack
+        Xw_norm = sk_normalize(Xw, norm='l2', axis=1)
+        Xc_norm = sk_normalize(Xc, norm='l2', axis=1)
+        item_vectors = sk_normalize(hstack([Xw_norm, Xc_norm]), norm='l2', axis=1)
+        tfidf = tfidf_word
+    else:
+        tfidf = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words=stop_words, analyzer='word', ngram_range=WORD_NGRAM, sublinear_tf=True, min_df=TFIDF_MIN_DF)
+        X = tfidf.fit_transform(corpus)
         try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(SBERT_MODEL)
-            # encode returns numpy array (n_items, dim)
-            embeddings = model.encode(corpus, show_progress_bar=False, convert_to_numpy=True, batch_size=32)
-            emb_norm = sk_normalize(embeddings, norm='l2', axis=1)
-            # build TF-IDF as well if we will concat
-            if CONCAT_SBERT:
-                tfidf = TfidfVectorizer(max_features=8000, stop_words=None, ngram_range=(1,1), sublinear_tf=True, min_df=1)
-                X = tfidf.fit_transform(corpus)  # sparse (n_items, n_features)
-                try:
-                    X_dense = X.toarray()
-                except Exception:
-                    X_dense = np.asarray(X.todense())
-                X_norm = sk_normalize(X_dense, norm='l2', axis=1)
-                # concatenar e normalizar vetor final
-                concat = np.hstack([X_norm, emb_norm])
-                item_vectors = sk_normalize(concat, norm='l2', axis=1)
-            else:
-                item_vectors = emb_norm
+            item_vectors = sk_normalize(X, norm='l2', axis=1)
         except Exception:
-            # if SBERT fails for any reason, fall back to TF-IDF
-            USE_SBERT = False
-    if not USE_SBERT:
-        # opção: concatenar TF-IDF word + char_wb
-        if CONCAT_WORD_CHAR_TFIDF:
-            # word-level TF-IDF (unigrams+bigrams)
-            tfidf_word = TfidfVectorizer(max_features=WORD_MAX_FEATURES, stop_words=None, analyzer='word', ngram_range=(1,2), sublinear_tf=True, min_df=1)
-            Xw = tfidf_word.fit_transform(corpus)
-            # char-level TF-IDF (char_wb 3-5)
-            tfidf_char = TfidfVectorizer(max_features=CHAR_MAX_FEATURES, stop_words=None, analyzer='char_wb', ngram_range=(3,5), sublinear_tf=True, min_df=1)
-            Xc = tfidf_char.fit_transform(corpus)
-            try:
-                Xw_dense = Xw.toarray()
-            except Exception:
-                Xw_dense = np.asarray(Xw.todense())
-            try:
-                Xc_dense = Xc.toarray()
-            except Exception:
-                Xc_dense = np.asarray(Xc.todense())
-            Xw_norm = sk_normalize(Xw_dense, norm='l2', axis=1)
-            Xc_norm = sk_normalize(Xc_dense, norm='l2', axis=1)
-            concat = np.hstack([Xw_norm, Xc_norm])
-            item_vectors = sk_normalize(concat, norm='l2', axis=1)
-            # keep last tfidf reference as word tfidf
-            tfidf = tfidf_word
-        else:
-            # usar unigrams e incluir termos raros (min_df configurável)
-            tfidf = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words=None, analyzer='word', ngram_range=(1,1), sublinear_tf=True, min_df=TFIDF_MIN_DF)
-            X = tfidf.fit_transform(corpus)  # sparse (n_items, n_features)
-            # Usar vetores TF-IDF normalizados por linha (sem LSA) — manter representações de conteúdo
-            try:
-                # normalizar cada vetor de item (linha) para norma L2
-                item_vectors = sk_normalize(X, norm='l2', axis=1)
-            except Exception:
-                # se normalização falhar, manter matriz TF-IDF crua
-                item_vectors = X
-    # compute item popularity (normalized count of positive ratings) to use as a small boost
-    global item_popularity
+            item_vectors = X
     try:
-        pos_counts = eval_df[eval_df["nota"] >= POSITIVE_RATING_THRESHOLD].groupby("item_id").size()
+        pos_counts = eval_df[eval_df['nota'] >= POSITIVE_RATING_THRESHOLD].groupby('item_id').size()
         counts = [pos_counts.get(iid, 0) for iid in item_ids]
         arr = np.array(counts, dtype=float)
-        if arr.max() > 0:
-            item_popularity = arr / arr.max()
-        else:
-            item_popularity = np.zeros(len(item_ids), dtype=float)
+        item_popularity = arr / arr.max() if arr.max() > 0 else np.zeros(len(item_ids))
     except Exception:
         item_popularity = np.zeros(len(item_ids), dtype=float)
 
-    # após construir item_vectors, também ajustar componente colaborativa
-    try:
-        # somente treinar componente colaborativa se o blend estiver ativo (collab_beta > 0)
-        if collab_beta and collab_beta > 0.0:
-            fit_collaborative()
-    except Exception:
-        # se falhar, manter collab desabilitada (None)
-        pass
 
-
-def fit_collaborative(k: int = None):
-    """Treina um modelo SVD simples sobre a matriz usuário-item (ratings) e popula
-    user_factors e item_factors_collab."""
-    global user_ids, user_id_to_idx, user_factors, item_factors_collab, collab_k
-    if k is None:
-        k = collab_k
-    # precisa de eval_df
-    if eval_df is None or eval_df.empty:
-        user_factors = None
-        item_factors_collab = None
-        return
-    # construir mapeamentos
-    user_ids = list(eval_df["usuario_id"].astype(str).unique())
-    user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
-    n_users = len(user_ids)
-    n_items = len(item_ids)
-    if n_users == 0 or n_items == 0:
-        user_factors = None
-        item_factors_collab = None
-        return
-
-    # montar matriz densa (n_users x n_items) — ml-100k é pequeno, denso aceitável
-    R = np.zeros((n_users, n_items), dtype=float)
-    for _, row in eval_df.iterrows():
-        u = str(row["usuario_id"])
-        iid = str(row["item_id"])
-        if u in user_id_to_idx and iid in item_id_to_idx:
-            ui = user_id_to_idx[u]
-            ii = item_id_to_idx[iid]
-            try:
-                R[ui, ii] = float(row.get("nota", 0.0))
-            except Exception:
-                R[ui, ii] = 0.0
-
-    # centrar por usuário (remover média) ajuda SVD
-    user_means = np.true_divide(R.sum(axis=1), (R != 0).sum(axis=1) + 1e-9)
-    R_centered = R - user_means[:, np.newaxis]
-    # preencher zeros (não-avaliações) com 0 (já estão) — SVD lidará com isso
-
-    # preferir Surprise SVD quando disponível e configurado
-    if collab_method == 'surprise' and _HAS_SURPRISE:
-        try:
-            # Surprise espera colunas user,item,rating em dataframe
-            df = eval_df[["usuario_id", "item_id", "nota"]].copy()
-            df["usuario_id"] = df["usuario_id"].astype(str)
-            df["item_id"] = df["item_id"].astype(str)
-            reader = Reader(rating_scale=(df["nota"].min(), df["nota"].max()))
-            data = Dataset.load_from_df(df[["usuario_id", "item_id", "nota"]], reader)
-            trainset = data.build_full_trainset()
-            n_comp = min(k, trainset.n_users - 1, trainset.n_items - 1) if (trainset.n_users > 1 and trainset.n_items > 1) else 0
-            if n_comp <= 0:
-                user_factors = None
-                item_factors_collab = None
-                return
-            algo = SurpriseSVD(n_factors=n_comp, random_state=42)
-            algo.fit(trainset)
-            # build user mapping and factors
-            user_ids = [trainset.to_raw_uid(i) for i in range(trainset.n_users)]
-            user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
-            user_factors = algo.pu  # shape (n_users_train, n_comp)
-            # build item_factors aligned to backend.item_ids ordering
-            item_factors_collab = np.zeros((len(item_ids), n_comp), dtype=float)
-            for inner_i in range(trainset.n_items):
-                raw_iid = trainset.to_raw_iid(inner_i)
-                if raw_iid in item_id_to_idx:
-                    idx = item_id_to_idx[raw_iid]
-                    item_factors_collab[idx, :] = algo.qi[inner_i]
-            collab_k = n_comp
-            return
-        except Exception:
-            # se Surprise falhar, cair para SVD tradicional
-            pass
-
-    n_comp = min(k, n_users - 1, n_items - 1) if (n_users > 1 and n_items > 1) else 0
-    if n_comp <= 0:
-        user_factors = None
-        item_factors_collab = None
-        return
-
-    svd = TruncatedSVD(n_components=n_comp, random_state=42)
-    user_factors = svd.fit_transform(R_centered)  # shape (n_users, n_comp)
-    # components_ : shape (n_comp, n_items) -> item_factors: (n_items, n_comp)
-    item_factors_collab = svd.components_.T
-    collab_k = n_comp
+ # (Suporte a filtragem colaborativa removido)
 
 fit_vectorizer()
 
@@ -450,29 +322,11 @@ def recommend_for_profile(profile_vector, top_n=10, exclude_ids: Optional[List[s
     # combine similarity with item popularity to slightly favor well-liked items
     try:
         if item_popularity is not None:
-            alpha = 0.0  # default: não misturar popularidade (grid mostrou beta alto com alpha baixo é melhor)
-            sims = (1 - alpha) * sims + alpha * item_popularity
+            sims = (1 - POP_ALPHA) * sims + POP_ALPHA * item_popularity
     except Exception:
         pass
 
-    # componente colaborativa: se usuario_id conhecido e modelo collab treinado
-    try:
-        if usuario_id is not None and item_factors_collab is not None and user_id_to_idx:
-            uid = str(usuario_id)
-            if uid in user_id_to_idx:
-                uidx = user_id_to_idx[uid]
-                # user_factors shape (n_users, k), item_factors_collab shape (n_items, k)
-                cf_scores = np.dot(user_factors[uidx], item_factors_collab.T)
-                # normalizar CF scores
-                if np.ptp(cf_scores) > 0:
-                    cf_scores = (cf_scores - cf_scores.min()) / (cf_scores.max() - cf_scores.min())
-                else:
-                    cf_scores = np.zeros_like(cf_scores)
-                # blend content and collaborative
-                beta = collab_beta
-                sims = (1 - beta) * sims + beta * cf_scores
-    except Exception:
-        pass
+    # (Sem blending colaborativo)
     # monta DataFrame temporário
     df = pd.DataFrame({
         "item_id": [idx_to_item_id[i] for i in range(len(sims))],
@@ -504,13 +358,48 @@ def evaluate_global():
         if len(pos) < 2:  # precisa de pelo menos 2 para fazer split train/test
             continue
         train, test = train_test_split(pos, test_size=TEST_SIZE_PER_USER, random_state=42)
-        profile = user_profile_from_item_ids(train)
+
+        # incorporar feedback negativo (todas as notas abaixo do threshold)
+        neg_df = user_ratings[user_ratings["nota"] < POSITIVE_RATING_THRESHOLD]
+        neg_ids = neg_df["item_id"].astype(str).unique().tolist()
+
+        # construir mapa de pesos: positivos (apenas treino) recebem peso positivo; negativos recebem peso negativo
+        ratings_map = {}
+        # pesos positivos normalizados (>= threshold)
+        for _, row in user_ratings.iterrows():
+            iid = str(row["item_id"])
+            try:
+                r = float(row.get("nota", 0.0))
+            except Exception:
+                r = 0.0
+            if iid in train and r >= POSITIVE_RATING_THRESHOLD:
+                # normaliza em [0.2, 1.0]
+                base = POSITIVE_RATING_THRESHOLD - 0.5
+                num = max(0.0, r - base)
+                den = max(0.5, 5.0 - base)
+                w = 0.2 + 0.8 * (num / den)
+                ratings_map[iid] = max(ratings_map.get(iid, 0.0), w)
+            elif iid in neg_ids:
+                # peso negativo proporcional à distância para o limiar
+                base = POSITIVE_RATING_THRESHOLD - 0.5
+                num = max(0.0, base - r)
+                den = max(0.5, base - 1.0)
+                scale = (num / den) if den > 0 else 0.0
+                w = -0.6 * min(1.0, scale)  # até -0.6
+                # acumular o menor (mais negativo)
+                ratings_map[iid] = min(ratings_map.get(iid, 0.0), w)
+
+        # construir perfil com itens de treino + negativos
+        profile_items = list(ratings_map.keys())
+        profile = user_profile_from_item_ids(profile_items, ratings_map=ratings_map)
         if profile is None:
             continue
         # recomendar top K onde K = len(test) * 2 (heurística) ou ao menos 1
         k = max(1, len(test))
+        # excluir itens de treino e todos os negativos; permitir itens de teste aparecerem
+        exclude = set(train) | set(neg_ids)
         # passar usuario_id para que a parte colaborativa seja usada na recomendação
-        recs = recommend_for_profile(profile, top_n=k*2, exclude_ids=train, usuario_id=u)
+        recs = recommend_for_profile(profile, top_n=k*2, exclude_ids=list(exclude), usuario_id=u)
         rec_ids = [r["item_id"] for r in recs]
         # calcula métricas simples
         hits = len(set(rec_ids).intersection(set(test)))
@@ -578,10 +467,35 @@ def recomendar(req: RecommendRequest):
         recs = [{"item_id": iid, "nome": items_df[items_df["item_id"] == iid]["nome"].values[0], "score": None} for iid in pos_global]
         return {"usuario_id": u, "n": req.n, "recommendations": recs}
 
-    # construir mapa item->rating para ponderar o perfil pelo quanto o usuário gostou
-    ratings_map = {row["item_id"]: row["nota"] for _, row in user_ratings.iterrows()}
-    profile = user_profile_from_item_ids(pos_items, ratings_map=ratings_map)
-    recs = recommend_for_profile(profile, top_n=req.n, exclude_ids=pos_items, usuario_id=u)
+    # construir mapa item->peso com positivos e negativos
+    neg_df = user_ratings[user_ratings["nota"] < POSITIVE_RATING_THRESHOLD]
+    neg_ids = neg_df["item_id"].astype(str).unique().tolist()
+
+    ratings_map = {}
+    for _, row in user_ratings.iterrows():
+        iid = str(row["item_id"])
+        try:
+            r = float(row.get("nota", 0.0))
+        except Exception:
+            r = 0.0
+        if r >= POSITIVE_RATING_THRESHOLD:
+            base = POSITIVE_RATING_THRESHOLD - 0.5
+            num = max(0.0, r - base)
+            den = max(0.5, 5.0 - base)
+            w = 0.2 + 0.8 * (num / den)
+            ratings_map[iid] = max(ratings_map.get(iid, 0.0), w)
+        else:
+            base = POSITIVE_RATING_THRESHOLD - 0.5
+            num = max(0.0, base - r)
+            den = max(0.5, base - 1.0)
+            scale = (num / den) if den > 0 else 0.0
+            w = -0.6 * min(1.0, scale)
+            ratings_map[iid] = min(ratings_map.get(iid, 0.0), w)
+
+    profile_items = list(ratings_map.keys())
+    profile = user_profile_from_item_ids(profile_items, ratings_map=ratings_map)
+    exclude = set(pos_items) | set(neg_ids)
+    recs = recommend_for_profile(profile, top_n=req.n, exclude_ids=list(exclude), usuario_id=u)
     return {"usuario_id": u, "n": req.n, "recommendations": recs}
 
 @app.get("/avaliacao")
@@ -592,22 +506,53 @@ def avaliacao():
 # endpoint para re-treinar vetorizador (útil se alterar filmes.csv)
 class RebuildRequest(BaseModel):
     title_repeat: Optional[int] = None
+    genre_repeat: Optional[int] = None
+    tags_repeat: Optional[int] = None
+    desc_repeat: Optional[int] = None
+    year_repeat: Optional[int] = None
     tfidf_max_features: Optional[int] = None
     tfidf_min_df: Optional[int] = None
+    word_ngram_high: Optional[int] = None  # 1 ou 2
+    concat_word_char_tfidf: Optional[bool] = None
+    word_max_features: Optional[int] = None
+    char_max_features: Optional[int] = None
+    pop_alpha: Optional[float] = None
 
 
 @app.post("/rebuild_vectors")
 def rebuild_vectors(req: RebuildRequest = None):
     try:
         # permite sobrepor parâmetros TF-IDF rapidamente via body JSON
-        global TITLE_REPEAT, TFIDF_MAX_FEATURES, TFIDF_MIN_DF
+        global TITLE_REPEAT, GENRE_REPEAT, TAGS_REPEAT, DESC_REPEAT, YEAR_REPEAT
+        global TFIDF_MAX_FEATURES, TFIDF_MIN_DF, WORD_NGRAM, CONCAT_WORD_CHAR_TFIDF
+        global WORD_MAX_FEATURES, CHAR_MAX_FEATURES, POP_ALPHA
+    # (Parâmetros SBERT removidos)
         if req is not None:
             if req.title_repeat is not None:
                 TITLE_REPEAT = int(req.title_repeat)
+            if req.genre_repeat is not None:
+                GENRE_REPEAT = int(req.genre_repeat)
+            if req.tags_repeat is not None:
+                TAGS_REPEAT = int(req.tags_repeat)
+            if req.desc_repeat is not None:
+                DESC_REPEAT = int(req.desc_repeat)
+            if req.year_repeat is not None:
+                YEAR_REPEAT = int(req.year_repeat)
             if req.tfidf_max_features is not None:
                 TFIDF_MAX_FEATURES = int(req.tfidf_max_features)
             if req.tfidf_min_df is not None:
                 TFIDF_MIN_DF = int(req.tfidf_min_df)
+            if req.word_ngram_high is not None:
+                n = int(req.word_ngram_high)
+                WORD_NGRAM = (1, max(1, min(3, n)))
+            if req.concat_word_char_tfidf is not None:
+                CONCAT_WORD_CHAR_TFIDF = bool(req.concat_word_char_tfidf)
+            if req.word_max_features is not None:
+                WORD_MAX_FEATURES = int(req.word_max_features)
+            if req.char_max_features is not None:
+                CHAR_MAX_FEATURES = int(req.char_max_features)
+            if req.pop_alpha is not None:
+                POP_ALPHA = float(req.pop_alpha)
         load_data()
         fit_vectorizer()
         return {"status": "ok", "n_items": len(item_ids)}
